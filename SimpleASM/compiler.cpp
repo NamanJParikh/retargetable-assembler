@@ -161,7 +161,7 @@ static std::string pythonRegisterExpression(Register reg) {
 }
 
 static std::string pythonAddressExpression(const Instruction& instruction, std::size_t index,
-                                           const std::map<std::string, uint64_t>& dataLabels) {
+                                           const std::map<std::string, std::size_t>& dataLabels) {
     const auto* address = std::get_if<Address>(&pythonOperandAt(instruction, index));
     if (!address || (!address->label && !address->baseRegister)) {
         throw std::invalid_argument(opcodeName(instruction.opcode) + " operand " +
@@ -202,7 +202,7 @@ static std::string pythonBranchLabel(const Instruction& instruction, std::size_t
 
 static void emitPythonInstruction(std::ostream& out, const Instruction& instruction, std::size_t index,
                                   const std::map<std::string, std::size_t>& codeLabels,
-                                  const std::map<std::string, uint64_t>& dataLabels) {
+                                  const std::map<std::string, std::size_t>& dataLabels) {
     auto regExpr = [&](std::size_t operandIndex) {
         return pythonRegisterExpression(pythonRegisterOperand(instruction, operandIndex));
     };
@@ -385,6 +385,142 @@ class Emitter {
         virtual ~Emitter() = default;
         virtual std::vector<uint8_t> emit(const Program& program) const = 0;
 };
+
+static uint64_t addressWithDisplacement(uint64_t base, int64_t displacement) {
+    return base + static_cast<uint64_t>(displacement);
+}
+
+static void rejectStaticallyInvalidOperations(
+    const Program& program,
+    const std::map<std::string, std::size_t>& dataLabels,
+    const std::vector<uint8_t>& data,
+    std::size_t programDataSize,
+    const std::string& emitterName) {
+    constexpr std::size_t GuestRegisterCount = 16;
+    std::vector<std::optional<uint64_t>> knownRegisters(GuestRegisterCount, uint64_t{0});
+    bool firstInstruction = true;
+
+    for (const auto& instruction : program.codeSection) {
+        if (instruction.label && !firstInstruction) {
+            std::fill(knownRegisters.begin(), knownRegisters.end(), std::nullopt);
+        }
+        firstInstruction = false;
+
+        if ((instruction.opcode == Opcode::DIV || instruction.opcode == Opcode::DIVS) &&
+            instruction.operands.size() == 2) {
+            const auto* divisor = std::get_if<Register>(&instruction.operands[1]);
+            if (divisor && *divisor != Register::Rc) {
+                const auto value = knownRegisters[static_cast<std::size_t>(*divisor)];
+                if (value && *value == 0) {
+                    throw std::invalid_argument(
+                        emitterName + " division by zero is statically guaranteed");
+                }
+            }
+        }
+
+        if ((instruction.opcode == Opcode::LMU || instruction.opcode == Opcode::LMS ||
+             instruction.opcode == Opcode::ST || instruction.opcode == Opcode::WRTE) &&
+            !instruction.operands.empty()) {
+            const std::size_t addressIndex =
+                instruction.opcode == Opcode::WRTE ? 0 : 1;
+            if (addressIndex < instruction.operands.size()) {
+                const auto* address =
+                    std::get_if<Address>(&instruction.operands[addressIndex]);
+                std::optional<uint64_t> base;
+                if (address && address->label) {
+                    const auto label = dataLabels.find(*address->label);
+                    if (label != dataLabels.end()) {
+                        base = static_cast<uint64_t>(label->second);
+                    }
+                } else if (address && address->baseRegister &&
+                           static_cast<std::size_t>(*address->baseRegister) <
+                               GuestRegisterCount) {
+                    base = knownRegisters[
+                        static_cast<std::size_t>(*address->baseRegister)];
+                }
+
+                if (address && base) {
+                    const uint64_t offset =
+                        addressWithDisplacement(*base, address->displacement);
+                    bool outOfBounds = false;
+                    if (instruction.opcode == Opcode::WRTE) {
+                        outOfBounds = offset >= programDataSize;
+                        if (!outOfBounds) {
+                            const auto first =
+                                data.begin() + static_cast<std::ptrdiff_t>(offset);
+                            const auto end =
+                                data.begin() + static_cast<std::ptrdiff_t>(programDataSize);
+                            outOfBounds = std::find(first, end, uint8_t{0}) == end;
+                        }
+                    } else if (instruction.operands.size() > 2) {
+                        const auto* width =
+                            std::get_if<Immediate>(&instruction.operands[2]);
+                        if (width && width->type != Type::Text &&
+                            width->numericalValue >= 1 && width->numericalValue <= 8) {
+                            const uint64_t size =
+                                static_cast<uint64_t>(width->numericalValue);
+                            outOfBounds = offset >= programDataSize ||
+                                          size > programDataSize - offset;
+                        }
+                    }
+                    if (outOfBounds) {
+                        throw std::invalid_argument(
+                            emitterName + (instruction.opcode == Opcode::WRTE
+                                ? " text address is statically out of bounds"
+                                : " memory access is statically out of bounds"));
+                    }
+                }
+            }
+        }
+
+        if (instruction.opcode == Opcode::BRU || instruction.opcode == Opcode::BRC) {
+            std::fill(knownRegisters.begin(), knownRegisters.end(), std::nullopt);
+            continue;
+        }
+
+        if (instruction.operands.empty()) {
+            continue;
+        }
+        const auto* destination = std::get_if<Register>(&instruction.operands[0]);
+        if (!destination || *destination == Register::Rc) {
+            continue;
+        }
+        const std::size_t index = static_cast<std::size_t>(*destination);
+        if (instruction.opcode == Opcode::LI && instruction.operands.size() == 2) {
+            const auto* immediate = std::get_if<Immediate>(&instruction.operands[1]);
+            knownRegisters[index] =
+                immediate && immediate->type != Type::Text
+                    ? std::optional<uint64_t>(
+                          static_cast<uint64_t>(immediate->numericalValue))
+                    : std::nullopt;
+        } else {
+            switch (instruction.opcode) {
+                case Opcode::LR:
+                case Opcode::LA:
+                case Opcode::LMU:
+                case Opcode::LMS:
+                case Opcode::AND:
+                case Opcode::OR:
+                case Opcode::XOR:
+                case Opcode::LSH:
+                case Opcode::RSH:
+                case Opcode::RSHS:
+                case Opcode::ADD:
+                case Opcode::ADDI:
+                case Opcode::SUB:
+                case Opcode::SUBI:
+                case Opcode::MUL:
+                case Opcode::MULS:
+                case Opcode::DIV:
+                case Opcode::DIVS:
+                    knownRegisters[index] = std::nullopt;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}
 
 class X86CodeGenerator {
     private:
@@ -1230,138 +1366,9 @@ class X86CodeGenerator {
             }
         }
 
-        static uint64_t addDisplacement(uint64_t base, int64_t displacement) {
-            return base + static_cast<uint64_t>(displacement);
-        }
-
         void rejectStaticallyInvalidOperations() const {
-            std::vector<std::optional<uint64_t>> knownRegisters(
-                GuestRegisterCount, uint64_t{0});
-            bool firstInstruction = true;
-
-            for (const auto& instruction : program_.codeSection) {
-                if (instruction.label && !firstInstruction) {
-                    std::fill(knownRegisters.begin(), knownRegisters.end(), std::nullopt);
-                }
-                firstInstruction = false;
-
-                if ((instruction.opcode == Opcode::DIV || instruction.opcode == Opcode::DIVS) &&
-                    instruction.operands.size() == 2) {
-                    const auto* divisor = std::get_if<Register>(&instruction.operands[1]);
-                    if (divisor && *divisor != Register::Rc) {
-                        const auto value =
-                            knownRegisters[static_cast<std::size_t>(*divisor)];
-                        if (value && *value == 0) {
-                            throw std::invalid_argument(
-                                "x86 division by zero is statically guaranteed");
-                        }
-                    }
-                }
-
-                if ((instruction.opcode == Opcode::LMU || instruction.opcode == Opcode::LMS ||
-                     instruction.opcode == Opcode::ST || instruction.opcode == Opcode::WRTE) &&
-                    !instruction.operands.empty()) {
-                    const std::size_t addressIndex =
-                        instruction.opcode == Opcode::WRTE ? 0 : 1;
-                    if (addressIndex < instruction.operands.size()) {
-                        const auto* address =
-                            std::get_if<Address>(&instruction.operands[addressIndex]);
-                        std::optional<uint64_t> base;
-                        if (address && address->label) {
-                            const auto label = dataLabels_.find(*address->label);
-                            if (label != dataLabels_.end()) {
-                                base = static_cast<uint64_t>(label->second);
-                            }
-                        } else if (address && address->baseRegister &&
-                                   static_cast<std::size_t>(*address->baseRegister) <
-                                       GuestRegisterCount) {
-                            base = knownRegisters[
-                                static_cast<std::size_t>(*address->baseRegister)];
-                        }
-
-                        if (address && base) {
-                            const uint64_t offset =
-                                addDisplacement(*base, address->displacement);
-                            bool outOfBounds = offset >= programDataSize_;
-                            if (instruction.opcode != Opcode::WRTE &&
-                                offset < programDataSize_ &&
-                                instruction.operands.size() > 2) {
-                                const auto* width =
-                                    std::get_if<Immediate>(&instruction.operands[2]);
-                                if (width && width->type != Type::Text &&
-                                    width->numericalValue > 0) {
-                                    const uint64_t size =
-                                        static_cast<uint64_t>(width->numericalValue);
-                                    outOfBounds =
-                                        outOfBounds || size > programDataSize_ - offset;
-                                }
-                            } else if (instruction.opcode == Opcode::WRTE &&
-                                       offset < programDataSize_) {
-                                const auto first =
-                                    data_.begin() + static_cast<std::ptrdiff_t>(offset);
-                                const auto end = data_.begin() +
-                                                 static_cast<std::ptrdiff_t>(programDataSize_);
-                                outOfBounds = std::find(first, end, uint8_t{0}) == end;
-                            }
-                            if (outOfBounds) {
-                                throw std::invalid_argument(
-                                    instruction.opcode == Opcode::WRTE
-                                        ? "x86 text address is statically out of bounds"
-                                        : "x86 memory access is statically out of bounds");
-                            }
-                        }
-                    }
-                }
-
-                if (instruction.opcode == Opcode::BRU || instruction.opcode == Opcode::BRC) {
-                    std::fill(knownRegisters.begin(), knownRegisters.end(), std::nullopt);
-                    continue;
-                }
-
-                if (instruction.operands.empty()) {
-                    continue;
-                }
-                const auto* destination =
-                    std::get_if<Register>(&instruction.operands[0]);
-                if (!destination || *destination == Register::Rc) {
-                    continue;
-                }
-                const std::size_t index = static_cast<std::size_t>(*destination);
-                if (instruction.opcode == Opcode::LI && instruction.operands.size() == 2) {
-                    const auto* immediate =
-                        std::get_if<Immediate>(&instruction.operands[1]);
-                    knownRegisters[index] =
-                        immediate && immediate->type != Type::Text
-                            ? std::optional<uint64_t>(
-                                  static_cast<uint64_t>(immediate->numericalValue))
-                            : std::nullopt;
-                } else {
-                    switch (instruction.opcode) {
-                        case Opcode::LR:
-                        case Opcode::LA:
-                        case Opcode::LMU:
-                        case Opcode::LMS:
-                        case Opcode::AND:
-                        case Opcode::OR:
-                        case Opcode::XOR:
-                        case Opcode::LSH:
-                        case Opcode::RSH:
-                        case Opcode::RSHS:
-                        case Opcode::ADD:
-                        case Opcode::ADDI:
-                        case Opcode::SUB:
-                        case Opcode::SUBI:
-                        case Opcode::MUL:
-                        case Opcode::MULS:
-                        case Opcode::DIV:
-                        case Opcode::DIVS:
-                            knownRegisters[index] = std::nullopt;
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            }
+            ::rejectStaticallyInvalidOperations(
+                program_, dataLabels_, data_, programDataSize_, "x86");
         }
 
         void buildCode() {
@@ -1499,7 +1506,7 @@ class PythonEmitter final : public Emitter {
     public:
         std::vector<uint8_t> emit(const Program& program) const override {
             std::vector<uint8_t> memory;
-            std::map<std::string, uint64_t> dataLabels;
+            std::map<std::string, std::size_t> dataLabels;
             for (const auto& entry : program.dataSection) {
                 if (!entry.label.empty()) {
                     dataLabels[entry.label] = memory.size();
@@ -1516,6 +1523,8 @@ class PythonEmitter final : public Emitter {
                     }
                 }
             }
+            rejectStaticallyInvalidOperations(
+                program, dataLabels, memory, memory.size(), "Python");
 
             std::map<std::string, std::size_t> codeLabels;
             for (std::size_t index = 0; index < program.codeSection.size(); ++index) {
@@ -1546,19 +1555,23 @@ class PythonEmitter final : public Emitter {
                       "    if label is not None:\n"
                       "        return data_labels[label] + displacement\n"
                       "    return registers[base_register] + displacement\n\n"
-                      "def check_memory_range(memory, address, size):\n"
-                      "    if address < 0 or size < 0 or address + size > len(memory):\n"
-                      "        raise IndexError('SimpleASM memory access out of bounds')\n\n"
+                      "def ensure_memory_range(memory, address, size):\n"
+                      "    if address < 0 or size < 0:\n"
+                      "        raise IndexError('SimpleASM memory access out of bounds')\n"
+                      "    end = address + size\n"
+                      "    if end > len(memory):\n"
+                      "        memory.extend(bytes(end - len(memory)))\n\n"
                       "def read_memory(memory, address, size, signed=False):\n"
-                      "    check_memory_range(memory, address, size)\n"
+                      "    ensure_memory_range(memory, address, size)\n"
                       "    return int.from_bytes(memory[address:address + size], 'little', signed=signed)\n\n"
                       "def write_memory(memory, address, value, size):\n"
-                      "    check_memory_range(memory, address, size)\n"
+                      "    ensure_memory_range(memory, address, size)\n"
                       "    mask = (1 << (size * 8)) - 1\n"
                       "    memory[address:address + size] = (value & mask).to_bytes(size, 'little')\n\n"
                       "def write_text(memory, address):\n"
-                      "    if address < 0 or address >= len(memory):\n"
+                      "    if address < 0:\n"
                       "        raise IndexError('SimpleASM text address out of bounds')\n"
+                      "    ensure_memory_range(memory, address, 1)\n"
                       "    end = memory.find(b'\\0', address)\n"
                       "    if end < 0:\n"
                       "        end = len(memory)\n"

@@ -40,13 +40,14 @@ directory, runs the emitted Python and its paired `*.expected.py` reference,
 and compares standard output and process exit status. It covers the arithmetic,
 logical, comparison, branch, memory, and text-output instructions supported by
 the Python emitter. The paired references describe expected final registers,
-memory, and output independently of emitted code. Negative fixtures verify
-runtime errors for out-of-bounds memory and text accesses, non-ASCII text
-output, and signed and unsigned division by zero. Fixtures exercise data-only
-programs with no `.CODE` section, code-only programs with no `.DATA` section,
-and an entirely empty program. The suite also covers `INT64_MIN / -1`, a text
-address exactly at the end of storage, and rejected zero or oversized memory
-access widths.
+memory, and output independently of emitted code. Positive out-of-bounds
+memory reads and writes extend the emulator's bytearray; statically provable
+negative/out-of-bounds memory and text accesses and division by zero are
+rejected during code generation. Fixtures exercise data-only programs with no
+`.CODE` section, code-only programs with no `.DATA` section, and an entirely
+empty program. The suite also covers `INT64_MIN / -1`, a text address exactly
+at the end of storage, non-ASCII text output, and rejected zero or oversized
+memory access widths.
 
 ### x86 Emitter
 

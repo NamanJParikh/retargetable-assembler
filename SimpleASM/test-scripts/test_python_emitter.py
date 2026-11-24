@@ -10,6 +10,15 @@ import unittest
 FIXTURE_DIR = Path(__file__).resolve().parent / "python-emitter"
 COMPILER = Path(__file__).resolve().parents[1] / "compile"
 SOURCES = sorted(FIXTURE_DIR.glob("*.sasm"))
+STATICALLY_INVALID = {
+    "out_of_bounds_negative_load.sasm": "Python memory access is statically out of bounds",
+    "out_of_bounds_negative_store.sasm": "Python memory access is statically out of bounds",
+    "out_of_bounds_text_at_end.sasm": "Python text address is statically out of bounds",
+    "out_of_bounds_text_negative.sasm": "Python text address is statically out of bounds",
+    "out_of_bounds_text_positive.sasm": "Python text address is statically out of bounds",
+    "signed_division_by_zero.sasm": "Python division by zero is statically guaranteed",
+    "unsigned_division_by_zero.sasm": "Python division by zero is statically guaranteed",
+}
 
 
 class PythonEmitterTests(unittest.TestCase):
@@ -40,10 +49,39 @@ class PythonEmitterTests(unittest.TestCase):
                     self.assertIn("size must be between 1 and 8 bytes", result.stderr)
                     self.assertFalse(emitted.exists(), f"Compiler emitted Python for {name}")
 
+    def test_rejects_statically_invalid_operations(self):
+        for source in SOURCES:
+            expected_error = STATICALLY_INVALID.get(source.name)
+            if expected_error is None:
+                continue
+
+            with self.subTest(fixture=source.name):
+                with tempfile.TemporaryDirectory(prefix="simpleasm-python-invalid-") as temp_dir:
+                    emitted = Path(temp_dir) / "emitted.py"
+                    result = subprocess.run(
+                        [str(COMPILER), "--emit", "python", "-o", str(emitted), str(source)],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"Compiler accepted invalid Python case {source.name}",
+                    )
+                    self.assertIn(expected_error, result.stderr)
+                    self.assertFalse(
+                        emitted.exists(),
+                        f"Compiler emitted Python for {source.name}",
+                    )
+
     def test_each_fixture_matches_reference(self):
         self.assertTrue(SOURCES, "No .sasm fixtures found")
         for source in SOURCES:
             with self.subTest(fixture=source.name):
+                if source.name in STATICALLY_INVALID:
+                    continue
                 reference = source.with_suffix(".expected.py")
                 self.assertTrue(reference.is_file(), f"Missing reference script: {reference.name}")
 
