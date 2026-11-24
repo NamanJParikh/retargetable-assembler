@@ -1561,6 +1561,7 @@ class Parser {
                 }
             }
 
+            validateProgram_(program);
             return program;
         }
 
@@ -1606,6 +1607,17 @@ class Parser {
             }
         }
 
+        static void validateLabel_(const std::string& label) {
+            if (label.empty() || !std::isupper(static_cast<unsigned char>(label.front()))) {
+                throw std::runtime_error("Invalid label: " + label);
+            }
+            for (unsigned char ch : label) {
+                if (!std::isupper(ch) && !std::isdigit(ch) && ch != '_') {
+                    throw std::runtime_error("Invalid label: " + label);
+                }
+            }
+        }
+
         static Immediate parseImmediate_(const std::string& token) {
             if (token.empty()) {
                 throw std::runtime_error("Empty immediate value");
@@ -1618,16 +1630,13 @@ class Parser {
             switch (prefix) {
                 case 'd':
                     immediate.type = Type::Decimal;
-                    immediate.numericalValue = std::stoll(payload, nullptr, 10);
-                    break;
+                    return parseNumericImmediate_(token, payload, 10, immediate.type);
                 case 'b':
                     immediate.type = Type::Binary;
-                    immediate.numericalValue = std::stoll(payload, nullptr, 2);
-                    break;
+                    return parseNumericImmediate_(token, payload, 2, immediate.type);
                 case 'x':
                     immediate.type = Type::Hex;
-                    immediate.numericalValue = std::stoll(payload, nullptr, 16);
-                    break;
+                    return parseNumericImmediate_(token, payload, 16, immediate.type);
                 case 't':
                     immediate.type = Type::Text;
                     if (payload.size() < 2 || payload.front() != '\'' || payload.back() != '\'') {
@@ -1641,6 +1650,25 @@ class Parser {
             return immediate;
         }
 
+        static Immediate parseNumericImmediate_(const std::string& token, const std::string& payload,
+                                                int base, Type type) {
+            try {
+                std::size_t parsedChars = 0;
+                const int64_t value = std::stoll(payload, &parsedChars, base);
+                if (payload.empty() || parsedChars != payload.size()) {
+                    throw std::runtime_error("Invalid numeric immediate: " + token);
+                }
+                Immediate immediate;
+                immediate.type = type;
+                immediate.numericalValue = value;
+                return immediate;
+            } catch (const std::invalid_argument&) {
+                throw std::runtime_error("Invalid numeric immediate: " + token);
+            } catch (const std::out_of_range&) {
+                throw std::runtime_error("Numeric immediate is out of range: " + token);
+            }
+        }
+
         static Register parseRegister_(const std::string& regStr) {
             if (regStr == "Rc") {
                 return Register::Rc;
@@ -1648,10 +1676,17 @@ class Parser {
 
             if (regStr.size() > 1 && regStr[0] == 'R') {
                 const std::string regNumText = regStr.substr(1);
-                std::size_t parsedChars = 0;
-                const int regNum = std::stoi(regNumText, &parsedChars);
-                if (parsedChars == regNumText.size() && regNum >= 0 && regNum <= 15) {
-                    return static_cast<Register>(regNum);
+                const bool allDigits = std::all_of(
+                    regNumText.begin(), regNumText.end(), [](unsigned char ch) {
+                        return std::isdigit(ch);
+                    });
+                const bool canonical = regNumText == "0" ||
+                    (!regNumText.empty() && regNumText.front() >= '1' && regNumText.front() <= '9');
+                if (allDigits && canonical && regNumText.size() <= 2) {
+                    const int regNum = std::stoi(regNumText);
+                    if (regNum <= 15) {
+                        return static_cast<Register>(regNum);
+                    }
                 }
             }
 
@@ -1691,10 +1726,14 @@ class Parser {
                 }
                 return addr;
             }
+            if (token.front() == '[' || token.back() == ']') {
+                throw std::runtime_error("Malformed address: " + token);
+            }
 
             const std::size_t opPos = token.find_first_of("+-");
             std::string label = token.substr(0, opPos);
             trim_(label);
+            validateLabel_(label);
             addr.label = label;
             if (opPos != std::string::npos) {
                 parseDisplacement(token, opPos);
@@ -1705,12 +1744,11 @@ class Parser {
         static Operand parseOperand_(const std::string& operandText) {
             if (operandText == "Rc" ||
                 (operandText.size() > 1 && operandText[0] == 'R' &&
-                 std::all_of(operandText.begin() + 1, operandText.end(), [](unsigned char ch) {
-                     return std::isdigit(ch);
-                 }))) {
+                 (std::isdigit(static_cast<unsigned char>(operandText[1])) ||
+                  operandText[1] == '+' || operandText[1] == '-'))) {
                 return parseRegister_(operandText);
             }
-            if (operandText[0] == '[' ||
+            if (operandText[0] == '[' || operandText.back() == ']' ||
                 std::isupper(static_cast<unsigned char>(operandText[0]))) {
                 return parseAddress_(operandText);
             }
@@ -1719,6 +1757,34 @@ class Parser {
                 return parseImmediate_(operandText);
             }
             return operandText;
+        }
+
+        static std::vector<std::string> splitOperands_(const std::string& text) {
+            std::vector<std::string> operands;
+            std::string operand;
+            bool inText = false;
+            for (char ch : text) {
+                if (ch == '\'') {
+                    inText = !inText;
+                }
+                if (ch == ',' && !inText) {
+                    trim_(operand);
+                    if (operand.empty()) {
+                        throw std::runtime_error("Malformed operand list: " + text);
+                    }
+                    operands.push_back(operand);
+                    operand.clear();
+                } else {
+                    operand += ch;
+                }
+            }
+            trim_(operand);
+            if (!operand.empty()) {
+                operands.push_back(operand);
+            } else if (!text.empty()) {
+                throw std::runtime_error("Malformed operand list: " + text);
+            }
+            return operands;
         }
 
         void parseData_(Program& program, const std::string& line) {
@@ -1735,6 +1801,7 @@ class Parser {
                 throw std::runtime_error("Malformed .DATA entry: " + line);
             }
 
+            validateLabel_(label);
             DataEntry entry;
             entry.label = label;
             entry.value = parseImmediate_(valueText);
@@ -1750,24 +1817,25 @@ class Parser {
             Instruction inst;
             std::string opcodeText;
 
-            if (!firstToken.empty() && std::all_of(firstToken.begin(), firstToken.end(), [](unsigned char ch) {
-                    return std::isupper(ch) || std::isdigit(ch);
-                }) && !isOpcode_(firstToken)) {
-                inst.label = firstToken;
-                stream >> opcodeText;
-            } else {
+            if (isOpcode_(firstToken)) {
                 opcodeText = firstToken;
+            } else {
+                std::string nextToken;
+                if (stream >> nextToken; !nextToken.empty() && isOpcode_(nextToken)) {
+                    validateLabel_(firstToken);
+                    inst.label = firstToken;
+                    opcodeText = nextToken;
+                } else {
+                    opcodeText = firstToken;
+                }
             }
 
             inst.opcode = stringToOpcode_(opcodeText);
 
             std::string operandText;
-            while (std::getline(stream, operandText, ',')) {
-                trim_(operandText);
-                if (operandText.empty()) {
-                    continue;
-                }
-                inst.operands.push_back(parseOperand_(operandText));
+            std::getline(stream, operandText);
+            for (const std::string& operand : splitOperands_(operandText)) {
+                inst.operands.push_back(parseOperand_(operand));
             }
 
             if (inst.opcode == Opcode::DEF) {
@@ -1785,6 +1853,166 @@ class Parser {
                 addLabel_(program, *inst.label, program.codeSection.size());
             }
             program.codeSection.push_back(inst);
+        }
+
+        static void requireOperandCount_(const Instruction& instruction, std::size_t count) {
+            if (instruction.operands.size() != count) {
+                throw std::runtime_error(opcodeName(instruction.opcode) + " requires " +
+                                          std::to_string(count) + " operands");
+            }
+        }
+
+        static void requireRegister_(const Instruction& instruction, std::size_t index) {
+            if (!std::holds_alternative<Register>(instruction.operands[index])) {
+                throw std::runtime_error(opcodeName(instruction.opcode) + " operand " +
+                                          std::to_string(index + 1) + " must be a register");
+            }
+        }
+
+        static void requireNumericImmediate_(const Instruction& instruction, std::size_t index) {
+            const auto* immediate = std::get_if<Immediate>(&instruction.operands[index]);
+            if (!immediate || immediate->type == Type::Text) {
+                throw std::runtime_error(opcodeName(instruction.opcode) + " operand " +
+                                          std::to_string(index + 1) + " must be a numeric immediate");
+            }
+        }
+
+        static void requireAddress_(const Instruction& instruction, std::size_t index,
+                                    const std::map<std::string, bool>& dataLabels) {
+            const auto* address = std::get_if<Address>(&instruction.operands[index]);
+            if (!address || (!address->label && !address->baseRegister)) {
+                throw std::runtime_error(opcodeName(instruction.opcode) + " operand " +
+                                          std::to_string(index + 1) + " must be an address");
+            }
+            if (address->label && dataLabels.find(*address->label) == dataLabels.end()) {
+                throw std::runtime_error("Unknown data label in address: " + *address->label);
+            }
+        }
+
+        static void requireCodeLabel_(const Instruction& instruction, std::size_t index,
+                                      const std::map<std::string, bool>& codeLabels) {
+            std::string label;
+            if (const auto* address = std::get_if<Address>(&instruction.operands[index]);
+                address && address->label) {
+                label = *address->label;
+            } else if (const auto* text = std::get_if<std::string>(&instruction.operands[index])) {
+                label = *text;
+                validateLabel_(label);
+            } else {
+                throw std::runtime_error(opcodeName(instruction.opcode) + " operand " +
+                                          std::to_string(index + 1) + " must be a code label");
+            }
+            if (codeLabels.find(label) == codeLabels.end()) {
+                throw std::runtime_error("Unknown code label: " + label);
+            }
+        }
+
+        static void validateInstruction_(const Instruction& instruction,
+                                        const std::map<std::string, bool>& dataLabels,
+                                        const std::map<std::string, bool>& codeLabels) {
+            const auto count = [&](std::size_t required) {
+                requireOperandCount_(instruction, required);
+            };
+            const auto registers = [&](std::size_t required) {
+                count(required);
+                for (std::size_t index = 0; index < required; ++index) {
+                    requireRegister_(instruction, index);
+                }
+            };
+
+            switch (instruction.opcode) {
+                case Opcode::LI:
+                    count(2);
+                    requireRegister_(instruction, 0);
+                    requireNumericImmediate_(instruction, 1);
+                    break;
+                case Opcode::LR:
+                case Opcode::AND:
+                case Opcode::OR:
+                case Opcode::XOR:
+                case Opcode::ADD:
+                case Opcode::SUB:
+                case Opcode::MUL:
+                case Opcode::MULS:
+                case Opcode::DIV:
+                case Opcode::DIVS:
+                case Opcode::CMP:
+                case Opcode::CMPS:
+                    registers(2);
+                    break;
+                case Opcode::LA:
+                    count(2);
+                    requireRegister_(instruction, 0);
+                    requireAddress_(instruction, 1, dataLabels);
+                    break;
+                case Opcode::LMU:
+                case Opcode::LMS:
+                case Opcode::ST:
+                    count(3);
+                    requireRegister_(instruction, 0);
+                    requireAddress_(instruction, 1, dataLabels);
+                    requireNumericImmediate_(instruction, 2);
+                    break;
+                case Opcode::LSH:
+                case Opcode::RSH:
+                case Opcode::RSHS:
+                case Opcode::ADDI:
+                case Opcode::SUBI:
+                    count(2);
+                    requireRegister_(instruction, 0);
+                    requireNumericImmediate_(instruction, 1);
+                    break;
+                case Opcode::BRU:
+                    count(1);
+                    requireCodeLabel_(instruction, 0, codeLabels);
+                    break;
+                case Opcode::BRC: {
+                    count(2);
+                    requireCodeLabel_(instruction, 0, codeLabels);
+                    const Operand& condition = instruction.operands[1];
+                    if (const auto* immediate = std::get_if<Immediate>(&condition)) {
+                        if (immediate->type == Type::Text ||
+                            immediate->numericalValue < 0 || immediate->numericalValue > 3) {
+                            throw std::runtime_error("BRC operand 2 must be a condition code from 0 to 3");
+                        }
+                    } else if (const auto* text = std::get_if<std::string>(&condition)) {
+                        if (*text != "0" && *text != "1" && *text != "2" && *text != "3" &&
+                            *text != "00" && *text != "01" && *text != "10" && *text != "11") {
+                            throw std::runtime_error("BRC operand 2 must be a condition code from 0 to 3");
+                        }
+                    } else {
+                        throw std::runtime_error("BRC operand 2 must be a condition code from 0 to 3");
+                    }
+                    break;
+                }
+                case Opcode::WRTE:
+                    count(1);
+                    requireAddress_(instruction, 0, dataLabels);
+                    break;
+                case Opcode::EXIT:
+                    count(0);
+                    break;
+                case Opcode::DEF:
+                    throw std::runtime_error("DEF is only valid as a data definition");
+            }
+        }
+
+        static void validateProgram_(const Program& program) {
+            std::map<std::string, bool> dataLabels;
+            std::map<std::string, bool> codeLabels;
+            for (const DataEntry& entry : program.dataSection) {
+                if (!entry.label.empty()) {
+                    dataLabels.emplace(entry.label, true);
+                }
+            }
+            for (const Instruction& instruction : program.codeSection) {
+                if (instruction.label) {
+                    codeLabels.emplace(*instruction.label, true);
+                }
+            }
+            for (const Instruction& instruction : program.codeSection) {
+                validateInstruction_(instruction, dataLabels, codeLabels);
+            }
         }
 };
 
