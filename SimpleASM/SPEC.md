@@ -74,6 +74,13 @@ enclosed in brackets.
 The return code for the program should be loaded into R0 before using EXIT to
 stop execution.
 
+## Expected Error Handling
+
+During code generation, statically provable out-of-bounds memory/text
+accesses and division by a known zero divisor are rejected. This avoids
+emitting programs whose behavior would otherwise depend on native x86 faults;
+checks are conservative and do not replace runtime bounds checking.
+
 ## Comments
 
 A line can be made a comment by starting it with ```*```.

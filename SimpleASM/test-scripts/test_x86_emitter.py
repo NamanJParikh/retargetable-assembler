@@ -20,8 +20,51 @@ class X86EmitterTests(unittest.TestCase):
     def setUpClass(cls):
         if not COMPILER.is_file():
             raise RuntimeError("Build SimpleASM/compile before running this harness")
+
+    def test_statically_invalid_fixtures_are_rejected(self):
+        for source in SOURCES:
+            expected_file = source.with_suffix(".expected.json")
+            if not expected_file.is_file():
+                continue
+            expected = json.loads(expected_file.read_text())
+            expected_compile_error = expected.get("compile_error")
+            if not expected_compile_error:
+                continue
+
+            with self.subTest(fixture=source.name):
+                with tempfile.TemporaryDirectory(prefix="simpleasm-x86-invalid-") as temp_dir:
+                    executable = Path(temp_dir) / "program.out"
+                    result = subprocess.run(
+                        [
+                            str(COMPILER),
+                            "--emit", "x86",
+                            "--x86-state-fd", "3",
+                            "-o", str(executable),
+                            str(source),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    self.assertNotEqual(
+                        result.returncode,
+                        0,
+                        f"Compiler accepted invalid x86 case {source.name}",
+                    )
+                    self.assertIn(
+                        expected_compile_error,
+                        result.stderr,
+                        f"Unexpected compiler error for {source.name}",
+                    )
+                    self.assertFalse(
+                        executable.exists(),
+                        f"Compiler created an executable for {source.name}",
+                    )
+
+    def test_each_fixture_matches_expected_behavior_and_state(self):
         if shutil.which("docker") is None:
-            raise RuntimeError("Docker is required to run x86 ELF tests")
+            self.skipTest("Docker is required to run x86 ELF tests")
         try:
             subprocess.run(
                 ["docker", "info"],
@@ -31,15 +74,15 @@ class X86EmitterTests(unittest.TestCase):
                 check=True,
             )
         except (OSError, subprocess.SubprocessError) as error:
-            raise RuntimeError(f"Docker is unavailable or its daemon is not running: {error}") from error
-
-    def test_each_fixture_matches_expected_behavior_and_state(self):
+            self.skipTest(f"Docker is unavailable or its daemon is not running: {error}")
         self.assertTrue(SOURCES, "No x86-emitter .sasm fixtures found")
         for source in SOURCES:
             with self.subTest(fixture=source.name):
                 expected_file = source.with_suffix(".expected.json")
                 self.assertTrue(expected_file.is_file(), f"Missing expected results: {expected_file.name}")
                 expected = json.loads(expected_file.read_text())
+                if expected.get("compile_error"):
+                    continue
 
                 with tempfile.TemporaryDirectory(prefix="simpleasm-x86-emitter-") as temp_dir:
                     work_dir = Path(temp_dir)
@@ -64,8 +107,6 @@ class X86EmitterTests(unittest.TestCase):
                         f"Compiler failed for {source.name}:\n{compile_result.stderr}",
                     )
                     self.assertTrue(executable.is_file(), f"Compiler did not create ELF for {source.name}")
-                    if expected.get("compile_only"):
-                        continue
 
                     run_result = subprocess.run(
                         [

@@ -1230,6 +1230,140 @@ class X86CodeGenerator {
             }
         }
 
+        static uint64_t addDisplacement(uint64_t base, int64_t displacement) {
+            return base + static_cast<uint64_t>(displacement);
+        }
+
+        void rejectStaticallyInvalidOperations() const {
+            std::vector<std::optional<uint64_t>> knownRegisters(
+                GuestRegisterCount, uint64_t{0});
+            bool firstInstruction = true;
+
+            for (const auto& instruction : program_.codeSection) {
+                if (instruction.label && !firstInstruction) {
+                    std::fill(knownRegisters.begin(), knownRegisters.end(), std::nullopt);
+                }
+                firstInstruction = false;
+
+                if ((instruction.opcode == Opcode::DIV || instruction.opcode == Opcode::DIVS) &&
+                    instruction.operands.size() == 2) {
+                    const auto* divisor = std::get_if<Register>(&instruction.operands[1]);
+                    if (divisor && *divisor != Register::Rc) {
+                        const auto value =
+                            knownRegisters[static_cast<std::size_t>(*divisor)];
+                        if (value && *value == 0) {
+                            throw std::invalid_argument(
+                                "x86 division by zero is statically guaranteed");
+                        }
+                    }
+                }
+
+                if ((instruction.opcode == Opcode::LMU || instruction.opcode == Opcode::LMS ||
+                     instruction.opcode == Opcode::ST || instruction.opcode == Opcode::WRTE) &&
+                    !instruction.operands.empty()) {
+                    const std::size_t addressIndex =
+                        instruction.opcode == Opcode::WRTE ? 0 : 1;
+                    if (addressIndex < instruction.operands.size()) {
+                        const auto* address =
+                            std::get_if<Address>(&instruction.operands[addressIndex]);
+                        std::optional<uint64_t> base;
+                        if (address && address->label) {
+                            const auto label = dataLabels_.find(*address->label);
+                            if (label != dataLabels_.end()) {
+                                base = static_cast<uint64_t>(label->second);
+                            }
+                        } else if (address && address->baseRegister &&
+                                   static_cast<std::size_t>(*address->baseRegister) <
+                                       GuestRegisterCount) {
+                            base = knownRegisters[
+                                static_cast<std::size_t>(*address->baseRegister)];
+                        }
+
+                        if (address && base) {
+                            const uint64_t offset =
+                                addDisplacement(*base, address->displacement);
+                            bool outOfBounds = offset >= programDataSize_;
+                            if (instruction.opcode != Opcode::WRTE &&
+                                offset < programDataSize_ &&
+                                instruction.operands.size() > 2) {
+                                const auto* width =
+                                    std::get_if<Immediate>(&instruction.operands[2]);
+                                if (width && width->type != Type::Text &&
+                                    width->numericalValue > 0) {
+                                    const uint64_t size =
+                                        static_cast<uint64_t>(width->numericalValue);
+                                    outOfBounds =
+                                        outOfBounds || size > programDataSize_ - offset;
+                                }
+                            } else if (instruction.opcode == Opcode::WRTE &&
+                                       offset < programDataSize_) {
+                                const auto first =
+                                    data_.begin() + static_cast<std::ptrdiff_t>(offset);
+                                const auto end = data_.begin() +
+                                                 static_cast<std::ptrdiff_t>(programDataSize_);
+                                outOfBounds = std::find(first, end, uint8_t{0}) == end;
+                            }
+                            if (outOfBounds) {
+                                throw std::invalid_argument(
+                                    instruction.opcode == Opcode::WRTE
+                                        ? "x86 text address is statically out of bounds"
+                                        : "x86 memory access is statically out of bounds");
+                            }
+                        }
+                    }
+                }
+
+                if (instruction.opcode == Opcode::BRU || instruction.opcode == Opcode::BRC) {
+                    std::fill(knownRegisters.begin(), knownRegisters.end(), std::nullopt);
+                    continue;
+                }
+
+                if (instruction.operands.empty()) {
+                    continue;
+                }
+                const auto* destination =
+                    std::get_if<Register>(&instruction.operands[0]);
+                if (!destination || *destination == Register::Rc) {
+                    continue;
+                }
+                const std::size_t index = static_cast<std::size_t>(*destination);
+                if (instruction.opcode == Opcode::LI && instruction.operands.size() == 2) {
+                    const auto* immediate =
+                        std::get_if<Immediate>(&instruction.operands[1]);
+                    knownRegisters[index] =
+                        immediate && immediate->type != Type::Text
+                            ? std::optional<uint64_t>(
+                                  static_cast<uint64_t>(immediate->numericalValue))
+                            : std::nullopt;
+                } else {
+                    switch (instruction.opcode) {
+                        case Opcode::LR:
+                        case Opcode::LA:
+                        case Opcode::LMU:
+                        case Opcode::LMS:
+                        case Opcode::AND:
+                        case Opcode::OR:
+                        case Opcode::XOR:
+                        case Opcode::LSH:
+                        case Opcode::RSH:
+                        case Opcode::RSHS:
+                        case Opcode::ADD:
+                        case Opcode::ADDI:
+                        case Opcode::SUB:
+                        case Opcode::SUBI:
+                        case Opcode::MUL:
+                        case Opcode::MULS:
+                        case Opcode::DIV:
+                        case Opcode::DIVS:
+                            knownRegisters[index] = std::nullopt;
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            }
+        }
+
         void buildCode() {
             // ^ zeroing out the registers at the start may not be the best move
             // ^ for more complex situations where multiple programs are being
@@ -1326,6 +1460,7 @@ class X86CodeGenerator {
 
         std::vector<uint8_t> generate() {
             buildData();
+            rejectStaticallyInvalidOperations();
             buildCode();
             return buildElf();
         }
