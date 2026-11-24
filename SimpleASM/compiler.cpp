@@ -1099,8 +1099,7 @@ class X86CodeGenerator {
         }
 
         void emitInstruction(const Instruction& instruction) {
-            // ^ signedMultiply is never used, can we safely get rid of it?
-            auto binary = [&](uint8_t opcode, bool signedMultiply = false) {
+            auto binary = [&](uint8_t opcode) {
                 requireOperandCount(instruction, 2);
                 const int destination = guestRegisterIndex(instruction, 0);
                 const int source = guestRegisterIndex(instruction, 1);
@@ -1108,7 +1107,6 @@ class X86CodeGenerator {
                 emitLoadGuestRegister(source, 1);
                 emitRegReg(opcode, 1, 0);
                 emitStoreGuestRegister(destination, 0);
-                (void)signedMultiply;
             };
 
             switch (instruction.opcode) {

@@ -58,6 +58,10 @@ INVALID_SOURCES = {
         ".CODE\nentry LI R0, d1\n",
         "Invalid label:",
     ),
+    "malformed_code_label": (
+        ".CODE\nBAD-LABEL LI R0, d1\n",
+        "Invalid label:",
+    ),
     "unknown_opcode": (
         ".CODE\nUNKNOWN\n",
         "Unknown instruction opcode:",

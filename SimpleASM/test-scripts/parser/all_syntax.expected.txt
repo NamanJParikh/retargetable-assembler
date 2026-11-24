@@ -1,10 +1,11 @@
-.DATA (6 entries)
+.DATA (7 entries)
   0: DECIMAL = Decimal(-42)
   1: BINARY = Binary(10)
   2: HEXADECIMAL = Hex(42)
   3: TEXT = Text("hello, world")
-  4: <anonymous> = Decimal(7)
-  5: EXTRA = Text("extra, data")
+  4: DATA_VALUE = Decimal(1)
+  5: <anonymous> = Decimal(7)
+  6: EXTRA = Text("extra, data")
 .CODE (35 instructions)
   START_POINT: LI R0, Decimal(1)
   LR R1, R0
@@ -41,10 +42,11 @@
   LI R15, Binary(1)
   LI R14, Hex(255)
   FINISH: EXIT
-Symbols (7 entries)
+Symbols (8 entries)
   BINARY -> 1
+  DATA_VALUE -> 4
   DECIMAL -> 0
-  EXTRA -> 5
+  EXTRA -> 6
   FINISH -> 34
   HEXADECIMAL -> 2
   START_POINT -> 0
