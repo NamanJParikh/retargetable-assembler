@@ -15,69 +15,28 @@ label handling, data-only and code-only programs, and empty input. It also
 checks malformed numeric values, text commas, exact register and label syntax,
 unknown labels, and invalid operand counts and types.
 
-### Python Emitter
+### Emitters
 
-Run the Python-emitter regression suite from the repository root:
-
-```sh
-python3 SimpleASM/test-scripts/test_python_emitter.py
-```
-
-To compare one expected Python script with one compiler-generated script:
+Build `SimpleASM/compile`, then run the combined Python/x86 differential suite
+from the repository root:
 
 ```sh
-python3 SimpleASM/test-scripts/compare_python.py expected.py generated.py
+python3 SimpleASM/test-scripts/test_emitters.py
 ```
 
-The comparison command runs both files with the current Python interpreter,
-compares stdout, stderr, and exit status, and displays unified diffs for output
-that differs. It exits with status `0` for a match, `1` for differences, or `2`
-if either script cannot be run. Use `--timeout SECONDS` to change the per-script
-execution limit.
-
-The harness compiles every `python-emitter/*.sasm` fixture to a temporary
-directory, runs the emitted Python and its paired `*.expected.py` reference,
-and compares standard output and process exit status. It covers the arithmetic,
-logical, comparison, branch, memory, and text-output instructions supported by
-the Python emitter. The paired references describe expected final registers,
-memory, and output independently of emitted code. Positive out-of-bounds
-memory reads and writes extend the emulator's bytearray; statically provable
-negative/out-of-bounds memory and text accesses and division by zero are
-rejected during code generation. Fixtures exercise data-only programs with no
-`.CODE` section, code-only programs with no `.DATA` section, and an entirely
-empty program. The suite also covers `INT64_MIN / -1`, a text address exactly
-at the end of storage, non-ASCII text output, and rejected zero or oversized
-memory access widths.
-
-### x86 Emitter
-
-Run the x86-emitter regression suite from the repository root with Docker
-available and `SimpleASM/compile` built:
-
-```sh
-python3 SimpleASM/test-scripts/test_x86_emitter.py
-```
-
-The harness compiles every `x86-emitter/*.sasm` fixture with state snapshots
-enabled, runs each ELF in a `linux/amd64` Ubuntu container, and compares its
-exit status, stdout, stderr, all R0-R15 and Rc values, and complete program
-storage against the paired `*.expected.json` file. Fixtures cover the
-arithmetic, logical, comparison, branch, memory, and text instructions
-currently implemented by the x86 backend, plus data-only and empty programs.
-
-The `python_*.sasm` fixtures mirror all Python-emitter source programs without
-overwriting the existing x86 fixtures; runtime cases exercise spilled-register
-arithmetic, control flow, memory, and text behavior. Positive-offset
-out-of-bounds load/store fixtures check the final declared-storage hex.
-Statically provable negative/out-of-bounds memory and text addresses, along
-with signed and unsigned division by zero, are expected to be rejected during
-x86 code generation rather than run as native fault cases. The
-spilled-address-base and aliasing fixtures exercise R9-R15 backing slots;
-division-boundary and memory-width fixtures cover signed overflow behavior,
-signed extension, and 1-, 2-, 4-, and 8-byte loads and stores. The R8 fixture
-tests R8 as an instruction operand and address base; separate negative tests
-check that invalid register identifiers and Rc as a general register are
-rejected.
+The combined harness reads its complete fixture corpus from
+`emitter-tests/shared/` and `emitter-tests/additional/`; it no longer reads
+fixtures from the separate emitter-specific directories. Each fixture is
+compiled and run through both emitters, comparing process status, program
+output, final registers, condition state, and declared storage. It normalizes
+x86 native data addresses against the Python emulator's byte offsets. Paired
+Python reference scripts and x86 JSON snapshots remain as independent checks.
+Statically invalid accesses and division by zero must be rejected by both
+emitters. The suite also checks invalid memory widths and x86-only register
+restrictions. Docker is required to execute generated x86 ELF files in
+`linux/amd64` containers. The former `test_python_emitter.py` and
+`test_x86_emitter.py` commands remain as compatibility entry points to this
+same suite.
 
 For x86-64 ELF tests on macOS, run the generated executable in an `amd64` Linux
 container. `--x86-state-fd 3` enables a final-state snapshot on inherited file
