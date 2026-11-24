@@ -12,7 +12,8 @@ The parser harness runs the compiler with `--emit print` and compares its
 parsed-program output to the paired `parser/*.expected.txt` snapshots. Its
 fixtures cover every opcode, operand type, immediate type, addressing form,
 label handling, data-only and code-only programs, and empty input. It also
-checks that representative malformed inputs are rejected with parser errors.
+checks malformed numeric values, text commas, exact register and label syntax,
+unknown labels, and invalid operand counts and types.
 
 ### Python Emitter
 

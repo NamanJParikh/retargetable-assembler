@@ -26,6 +26,38 @@ INVALID_SOURCES = {
         ".CODE\nLI R16, d1\n",
         "Invalid register identifier:",
     ),
+    "register_with_leading_zero": (
+        ".CODE\nLI R01, d1\n",
+        "Invalid register identifier:",
+    ),
+    "register_with_sign": (
+        ".CODE\nLI R+1, d1\n",
+        "Invalid register identifier:",
+    ),
+    "decimal_suffix": (
+        ".DATA\nVALUE d12junk\n",
+        "Invalid numeric immediate:",
+    ),
+    "binary_suffix": (
+        ".DATA\nVALUE b102\n",
+        "Invalid numeric immediate:",
+    ),
+    "hex_suffix": (
+        ".DATA\nVALUE x2ag\n",
+        "Invalid numeric immediate:",
+    ),
+    "lowercase_data_label": (
+        ".DATA\nvalue d1\n",
+        "Invalid label:",
+    ),
+    "malformed_data_label": (
+        ".DATA\nBAD-LABEL d1\n",
+        "Invalid label:",
+    ),
+    "lowercase_code_label": (
+        ".CODE\nentry LI R0, d1\n",
+        "Invalid label:",
+    ),
     "unknown_opcode": (
         ".CODE\nUNKNOWN\n",
         "Unknown instruction opcode:",
@@ -41,6 +73,22 @@ INVALID_SOURCES = {
     "text_address_displacement": (
         ".CODE\nLA R0, [R1 + t'x']\n",
         "Address displacement must be numeric:",
+    ),
+    "unknown_data_label": (
+        ".CODE\nLA R0, MISSING\n",
+        "Unknown data label in address:",
+    ),
+    "unknown_code_label": (
+        ".CODE\nBRU MISSING\n",
+        "Unknown code label:",
+    ),
+    "invalid_operand_type": (
+        ".CODE\nADD R0, d1\n",
+        "ADD operand 2 must be a register",
+    ),
+    "invalid_operand_count": (
+        ".CODE\nEXIT d1\n",
+        "EXIT requires 0 operands",
     ),
 }
 

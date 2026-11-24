@@ -3,9 +3,9 @@
 DECIMAL d-42
 BINARY b1010
 HEXADECIMAL x2a
-TEXT t'hello world'
+TEXT t'hello, world'
 .CODE
-START LI R0, d1
+START_POINT LI R0, d1
       LR R1, R0
       LA R2, DECIMAL
       LA R3, DECIMAL + d2
@@ -40,5 +40,5 @@ START LI R0, d1
       LI R15, b1
       LI R14, xff
       DEF d7
-EXTRA DEF t'extra data'
+EXTRA DEF t'extra, data'
 FINISH EXIT

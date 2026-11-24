@@ -2,11 +2,11 @@
   0: DECIMAL = Decimal(-42)
   1: BINARY = Binary(10)
   2: HEXADECIMAL = Hex(42)
-  3: TEXT = Text("hello world")
+  3: TEXT = Text("hello, world")
   4: <anonymous> = Decimal(7)
-  5: EXTRA = Text("extra data")
+  5: EXTRA = Text("extra, data")
 .CODE (35 instructions)
-  START: LI R0, Decimal(1)
+  START_POINT: LI R0, Decimal(1)
   LR R1, R0
   LA R2, DECIMAL
   LA R3, DECIMAL + 2
@@ -47,5 +47,5 @@ Symbols (7 entries)
   EXTRA -> 5
   FINISH -> 34
   HEXADECIMAL -> 2
-  START -> 0
+  START_POINT -> 0
   TEXT -> 3
