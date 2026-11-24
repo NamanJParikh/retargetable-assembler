@@ -60,7 +60,7 @@ syntax implemented.
 ## Part 2: Simple Assembly
 
 To work more with machine code, I'll make a fairly simple but functional assembly
-language and compile it to a few architectures, as well as just a simple Python
+language and assemble it to a few architectures, as well as just a simple Python
 emulator.
 
 The main complexity here is in providing more registers than are available to 
@@ -118,3 +118,21 @@ This is definitely made a lot more efficient with AI, but I'm finding that it
 needs some pointers to get comprehensive tests. Unrelated to AI, I've never
 used elaborate testing tools like the python unittest library, so I'm finding
 the process very informative.
+
+### Differential Testing and Resolving Issues
+
+I've focused a lot of effort into the testing methodology, ensuring it's simple to use,
+comprehensive, and fairly rigorous. There are certainly more rigorous methods I 
+could use, but I think differential testing is sufficient for the sake of
+this project. In particular, using the LLVM backend as reference and comparing 
+program byte by byte or at least the state line by line would be more thorough, 
+something I may come back to after implementation is done. 
+
+I'm finding that the AI tools still tend to take shortcuts, like making tests
+based on the compiler behavior rather than calculating expected behavior from the
+SPEC, but with interruption and correction, they get there in the end. 
+
+It is encouraging to see that asking AI to review the code and list issues it finds
+produces a lot of the same issues I found in code review and was concerned about 
+when testing, such as dead code and insufficient error parsing around `stoi` and
+`stoll`. 
