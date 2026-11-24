@@ -131,8 +131,11 @@ Data entries are parsed into typed immediate values. Code lines are parsed into
 instructions with an optional label and operands represented as registers,
 immediates, addresses, or strings (used for values such as condition codes).
 Invalid opcodes, malformed data entries, and invalid immediate or register
-formats produce parser errors. Non-comment content before a section declaration
-and duplicate labels also produce parser errors.
+formats produce parser errors. Labels must begin with an uppercase letter and
+contain only uppercase letters, digits, or underscores. Non-comment content
+before a section declaration and duplicate labels also produce parser errors.
+The parser validates instruction operand counts and types and resolves data
+and code label references before returning a program.
 
 `DEF` in the code section is treated as a data definition rather than an
 executable instruction. Its immediate is appended to the program's data section;
