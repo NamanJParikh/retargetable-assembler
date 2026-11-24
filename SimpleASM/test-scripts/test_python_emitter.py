@@ -16,6 +16,30 @@ class PythonEmitterTests(unittest.TestCase):
     def test_compiler_available(self):
         self.assertTrue(COMPILER.is_file(), "Build SimpleASM/compile before running this harness")
 
+    def test_rejects_invalid_memory_widths(self):
+        invalid_sources = {
+            "LMU zero width": (".DATA\nVALUE d0\n.CODE\nLMU R0, VALUE, d0\nEXIT\n", "LMU"),
+            "LMS width above eight": (".DATA\nVALUE d0\n.CODE\nLMS R0, VALUE, d9\nEXIT\n", "LMS"),
+            "ST zero width": (".DATA\nVALUE d0\n.CODE\nST R0, VALUE, d0\nEXIT\n", "ST"),
+            "ST width above eight": (".DATA\nVALUE d0\n.CODE\nST R0, VALUE, d9\nEXIT\n", "ST"),
+        }
+        with tempfile.TemporaryDirectory(prefix="simpleasm-python-invalid-width-") as temp_dir:
+            for name, (source_text, opcode) in invalid_sources.items():
+                with self.subTest(width=name):
+                    source = Path(temp_dir) / f"{opcode}-{name.replace(' ', '-')}.sasm"
+                    emitted = Path(temp_dir) / f"{source.stem}.py"
+                    source.write_text(source_text)
+                    result = subprocess.run(
+                        [str(COMPILER), "--emit", "python", "-o", str(emitted), str(source)],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=False,
+                    )
+                    self.assertNotEqual(result.returncode, 0, f"Compiler accepted {name}")
+                    self.assertIn("size must be between 1 and 8 bytes", result.stderr)
+                    self.assertFalse(emitted.exists(), f"Compiler emitted Python for {name}")
+
     def test_each_fixture_matches_reference(self):
         self.assertTrue(SOURCES, "No .sasm fixtures found")
         for source in SOURCES:

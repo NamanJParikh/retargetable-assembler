@@ -44,7 +44,9 @@ memory, and output independently of emitted code. Negative fixtures verify
 runtime errors for out-of-bounds memory and text accesses, non-ASCII text
 output, and signed and unsigned division by zero. Fixtures exercise data-only
 programs with no `.CODE` section, code-only programs with no `.DATA` section,
-and an entirely empty program.
+and an entirely empty program. The suite also covers `INT64_MIN / -1`, a text
+address exactly at the end of storage, and rejected zero or oversized memory
+access widths.
 
 ### x86 Emitter
 
