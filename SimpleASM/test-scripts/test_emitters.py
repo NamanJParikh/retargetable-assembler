@@ -183,15 +183,24 @@ class EmitterDifferentialTests(unittest.TestCase):
         if shutil.which("docker") is None:
             self.skipTest("Docker is required to run x86 ELF tests")
         try:
-            subprocess.run(
+            docker_info = subprocess.run(
                 ["docker", "info"],
                 capture_output=True,
                 text=True,
                 timeout=15,
-                check=True,
+                check=False,
             )
-        except (OSError, subprocess.SubprocessError) as error:
-            self.skipTest(f"Docker is unavailable or its daemon is not running: {error}")
+        except subprocess.TimeoutExpired:
+            self.skipTest("Docker is unavailable: `docker info` timed out after 15 seconds")
+        except OSError as error:
+            self.skipTest(f"Docker is unavailable: could not run `docker info`: {error}")
+        if docker_info.returncode != 0:
+            detail = docker_info.stderr.strip()
+            suffix = f": {detail}" if detail else ""
+            self.skipTest(
+                "Docker is unavailable or its daemon is not running: "
+                f"`docker info` exited with status {docker_info.returncode}{suffix}"
+            )
 
         for source in FIXTURE_SOURCES:
             expected_file = source.with_suffix(".expected.json")
@@ -324,6 +333,15 @@ class EmitterDifferentialTests(unittest.TestCase):
 def main():
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(EmitterDifferentialTests)
     result = unittest.TextTestRunner(verbosity=2, stream=sys.stdout).run(suite)
+    docker_skip_reasons = [
+        reason
+        for _, reason in result.skipped
+        if reason.startswith(("Docker is required", "Docker is unavailable"))
+    ]
+    if docker_skip_reasons:
+        print("Docker unavailable; x86 runtime differential tests were skipped:")
+        for reason in docker_skip_reasons:
+            print(f"  {reason}")
     return 0 if result.wasSuccessful() else 1
 
 
