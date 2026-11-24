@@ -128,6 +128,14 @@ this project. In particular, using the LLVM backend as reference and comparing
 program byte by byte or at least the state line by line would be more thorough, 
 something I may come back to after implementation is done. 
 
+I think testing is perhaps the best place to start when using AI-generated code
+since it makes it so easy for agents to catch bugs as they go. It would also 
+ensure tests are generated based on the SPEC and not the existing implementation
+if the implementation doesn't exist yet. Because I learned this, I've prioritized
+building and polishing the testing before moving on to implement the ARM emitter.
+I think this will make that process much smoother and leave me with more confidence
+in the final code.
+
 I'm finding that the AI tools still tend to take shortcuts, like making tests
 based on the compiler behavior rather than calculating expected behavior from the
 SPEC, but with interruption and correction, they get there in the end. 
