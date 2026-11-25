@@ -75,7 +75,7 @@ parsed program.
 # Native x86-64 Linux ELF: writes /tmp/hello-x86.out
 ./SimpleASM/compile --emit x86 -o /tmp/hello-x86.out /tmp/hello.sasm
 
-# Native AArch64 Linux ELF: writes an executable file
+# Native AArch64 Linux ELF: writes /tmp/hello-arm.out
 ./SimpleASM/compile --emit arm -o /tmp/hello-arm.out /tmp/hello.sasm
 ```
 
