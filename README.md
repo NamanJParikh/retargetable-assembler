@@ -63,6 +63,9 @@ To inspect the parsed program without generating a target:
 ./SimpleASM/compile --emit print /tmp/hello.sasm
 ```
 
+This is also the default when `--emit` is omitted: the compiler prints the
+parsed program.
+
 ## Emitters and output
 
 ```sh
@@ -72,20 +75,20 @@ To inspect the parsed program without generating a target:
 # Native x86-64 Linux ELF: writes /tmp/hello-x86.out
 ./SimpleASM/compile --emit x86 -o /tmp/hello-x86.out /tmp/hello.sasm
 
-# Native AArch64 Linux ELF: binary output goes to stdout
-./SimpleASM/compile --emit arm /tmp/hello.sasm > /tmp/hello-arm
-chmod +x /tmp/hello-arm
+# Native AArch64 Linux ELF: writes an executable file
+./SimpleASM/compile --emit arm -o /tmp/hello-arm.out /tmp/hello.sasm
 ```
 
-Python and x86 output paths can also be selected with `-o` or `--output`.
-`--emit arm` writes the ELF image to standard output so it can be redirected
-to a file. The native targets are Linux executables: run x86 output on
-x86-64 Linux and ARM output on AArch64 Linux. On other hosts, a suitably
-configured Linux container or emulator can be used. For example, with Docker:
+Python, x86, and ARM output paths can also be selected with `-o` or `--output`.
+Without an explicit output path, the compiler writes Python files with a `.py`
+extension and native executables with a `.out` extension beside the source
+file. The native targets are Linux executables: run x86 output on x86-64 Linux
+and ARM output on AArch64 Linux. On other hosts, a suitably configured Linux
+container or emulator can be used. For example, with Docker:
 
 ```sh
 docker run --rm --platform linux/arm64 \
-  --volume /tmp:/work --workdir /work ubuntu:24.04 ./hello-arm
+  --volume /tmp:/work --workdir /work ubuntu:24.04 ./hello-arm.out
 ```
 
 Use `--help` for the command-line options. The `--x86-state-fd <fd>` and

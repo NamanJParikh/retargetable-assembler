@@ -3133,6 +3133,7 @@ static std::optional<Architecture> parseArchitecture_(const std::string& value) 
 static void printUsage_(const char* argv0) {
     std::cerr << "Usage: " << argv0 << " [--emit <target>] [-o <output_file>] <source_file.s>\n"
               << "Targets: print, x86, arm, python\n"
+              << "Default target: print (prints the parsed program)\n"
               << "Debugging options:\n"
               << "       --x86-state-fd <fd> writes an x86 final-state snapshot to <fd>\n"
               << "       --arm-state-fd <fd> writes an ARM final-state snapshot to <fd>\n";
