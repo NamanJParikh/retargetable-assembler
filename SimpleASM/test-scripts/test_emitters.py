@@ -1,4 +1,4 @@
-"""Differentially test the Python and x86 SimpleASM emitters."""
+"""Differentially test the Python, x86, and ARM SimpleASM emitters."""
 import json
 import os
 from pathlib import Path
@@ -19,6 +19,7 @@ SHARED_FIXTURE_DIR = EMITTER_FIXTURE_DIR / "shared"
 ADDITIONAL_FIXTURE_DIR = EMITTER_FIXTURE_DIR / "additional"
 COMPILER = SCRIPT_DIR.parent / "compile"
 DOCKER_IMAGE = "ubuntu:24.04"
+ARM_DOCKER_PLATFORM = "linux/arm64"
 FIXTURE_SOURCES = sorted(SHARED_FIXTURE_DIR.glob("*.sasm")) + sorted(
     ADDITIONAL_FIXTURE_DIR.glob("*.sasm")
 )
@@ -40,6 +41,67 @@ def compile_program(target, source, output, state_snapshot=False):
         timeout=15,
         check=False,
     )
+
+
+def compile_arm_program(source, output):
+    result = subprocess.run(
+        [str(COMPILER), "--emit", "arm", str(source)],
+        capture_output=True,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode == 0:
+        output.write_bytes(result.stdout)
+        output.chmod(output.stat().st_mode | 0o111)
+    return result
+
+
+def docker_unavailable_reason(platform=None):
+    if shutil.which("docker") is None:
+        return "Docker is required to run native executable tests"
+    try:
+        docker_info = subprocess.run(
+            ["docker", "info"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return "Docker is unavailable: `docker info` timed out after 15 seconds"
+    except OSError as error:
+        return f"Docker is unavailable: could not run `docker info`: {error}"
+    if docker_info.returncode != 0:
+        detail = docker_info.stderr.strip()
+        suffix = f": {detail}" if detail else ""
+        return f"Docker is unavailable or its daemon is not running{suffix}"
+
+    if platform:
+        try:
+            platform_check = subprocess.run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--platform",
+                    platform,
+                    DOCKER_IMAGE,
+                    "true",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return f"Docker could not start a {platform} container within 60 seconds"
+        except OSError as error:
+            return f"Docker could not run a {platform} container: {error}"
+        if platform_check.returncode != 0:
+            detail = platform_check.stderr.strip()
+            suffix = f": {detail}" if detail else ""
+            return f"Docker cannot run {platform} containers{suffix}"
+    return None
 
 
 def read_python_state(stdout):
@@ -105,7 +167,7 @@ class EmitterDifferentialTests(unittest.TestCase):
                 if source.parent == SHARED_FIXTURE_DIR and not expected.get("compile_error"):
                     self.assertTrue(reference.is_file(), f"Missing Python reference: {reference.name}")
 
-    def test_both_emitters_reject_statically_invalid_fixtures(self):
+    def test_emitters_reject_statically_invalid_fixtures(self):
         for source in FIXTURE_SOURCES:
             expected_file = source.with_suffix(".expected.json")
             expected = json.loads(expected_file.read_text())
@@ -122,6 +184,8 @@ class EmitterDifferentialTests(unittest.TestCase):
                     x86_output = work_dir / "program.out"
                     python_result = compile_program("python", source, python_output)
                     x86_result = compile_program("x86", source, x86_output)
+                    arm_output = work_dir / "program.arm"
+                    arm_result = compile_arm_program(source, arm_output)
 
                     self.assertNotEqual(python_result.returncode, 0)
                     self.assertIn(
@@ -132,8 +196,14 @@ class EmitterDifferentialTests(unittest.TestCase):
                     self.assertNotEqual(x86_result.returncode, 0)
                     self.assertIn(expected_error, x86_result.stderr)
                     self.assertFalse(x86_output.exists())
+                    self.assertNotEqual(arm_result.returncode, 0)
+                    self.assertIn(
+                        re.sub(r"^x86\s+", "", expected_error, count=1),
+                        arm_result.stderr.decode(errors="replace"),
+                    )
+                    self.assertFalse(arm_output.exists())
 
-    def test_both_emitters_reject_invalid_memory_widths(self):
+    def test_emitters_reject_invalid_memory_widths(self):
         invalid_sources = {
             "LMU zero width": ".DATA\nVALUE d0\n.CODE\nLMU R0, VALUE, d0\nEXIT\n",
             "LMS width above eight": ".DATA\nVALUE d0\n.CODE\nLMS R0, VALUE, d9\nEXIT\n",
@@ -147,18 +217,23 @@ class EmitterDifferentialTests(unittest.TestCase):
                     print(f"  invalid width: {name}", flush=True)
                     source = work_dir / f"{name.replace(' ', '-')}.sasm"
                     source.write_text(source_text)
-                    for target in ("python", "x86"):
+                    for target in ("python", "x86", "arm"):
                         output = work_dir / f"{source.stem}.{target}"
-                        result = compile_program(target, source, output)
+                        if target == "arm":
+                            result = compile_arm_program(source, output)
+                            stderr = result.stderr.decode(errors="replace")
+                        else:
+                            result = compile_program(target, source, output)
+                            stderr = result.stderr
                         self.assertNotEqual(result.returncode, 0, f"{target} accepted {name}")
                         self.assertIn(
                             "size must be between 1 and 8 bytes",
-                            result.stderr,
+                            stderr,
                             f"Unexpected {target} diagnostic for {name}",
                         )
                         self.assertFalse(output.exists())
 
-    def test_x86_rejects_registers_outside_simpleasm_range(self):
+    def test_native_emitters_reject_registers_outside_simpleasm_range(self):
         invalid_sources = {
             "R16 instruction operand": (".CODE\nLI R16, d1\nEXIT\n", "register"),
             "condition register as general register": (
@@ -170,37 +245,27 @@ class EmitterDifferentialTests(unittest.TestCase):
             work_dir = Path(temp_dir)
             for name, (source_text, expected_error) in invalid_sources.items():
                 with self.subTest(source=name):
-                    print(f"  invalid x86 register: {name}", flush=True)
+                    print(f"  invalid native register: {name}", flush=True)
                     source = work_dir / "invalid.sasm"
                     source.write_text(source_text)
-                    output = work_dir / "program.out"
-                    result = compile_program("x86", source, output)
-                    self.assertNotEqual(result.returncode, 0, f"Compiler accepted {name}")
-                    self.assertIn(expected_error, result.stderr)
-                    self.assertFalse(output.exists())
+                    for target in ("x86", "arm"):
+                        output = work_dir / f"program.{target}"
+                        if target == "arm":
+                            result = compile_arm_program(source, output)
+                            stderr = result.stderr.decode(errors="replace")
+                        else:
+                            result = compile_program(target, source, output)
+                            stderr = result.stderr
+                        self.assertNotEqual(
+                            result.returncode, 0, f"{target} accepted {name}"
+                        )
+                        self.assertIn(expected_error, stderr)
+                        self.assertFalse(output.exists())
 
     def test_runtime_fixtures_match_between_emitters(self):
-        if shutil.which("docker") is None:
-            self.skipTest("Docker is required to run x86 ELF tests")
-        try:
-            docker_info = subprocess.run(
-                ["docker", "info"],
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            self.skipTest("Docker is unavailable: `docker info` timed out after 15 seconds")
-        except OSError as error:
-            self.skipTest(f"Docker is unavailable: could not run `docker info`: {error}")
-        if docker_info.returncode != 0:
-            detail = docker_info.stderr.strip()
-            suffix = f": {detail}" if detail else ""
-            self.skipTest(
-                "Docker is unavailable or its daemon is not running: "
-                f"`docker info` exited with status {docker_info.returncode}{suffix}"
-            )
+        docker_error = docker_unavailable_reason()
+        if docker_error:
+            self.skipTest(docker_error)
 
         for source in FIXTURE_SOURCES:
             expected_file = source.with_suffix(".expected.json")
@@ -329,6 +394,86 @@ class EmitterDifferentialTests(unittest.TestCase):
                         )
                 print(f"  passed: {label}", flush=True)
 
+    def test_arm_runtime_fixtures_match_python(self):
+        docker_error = docker_unavailable_reason(ARM_DOCKER_PLATFORM)
+        if docker_error:
+            self.skipTest(docker_error)
+
+        for source in FIXTURE_SOURCES:
+            expected_file = source.with_suffix(".expected.json")
+            expected = json.loads(expected_file.read_text())
+            if expected.get("compile_error"):
+                continue
+
+            label = fixture_label(source)
+            with self.subTest(fixture=label):
+                print(f"  ARM differential fixture: {label}", flush=True)
+                with tempfile.TemporaryDirectory(
+                    prefix="simpleasm-arm-differential-"
+                ) as temp_dir:
+                    work_dir = Path(temp_dir)
+                    python_output = work_dir / "program.py"
+                    arm_output = work_dir / "program.arm"
+                    python_compile = compile_program("python", source, python_output)
+                    self.assertEqual(
+                        python_compile.returncode,
+                        0,
+                        f"Python compiler failed for {source.name}:\n{python_compile.stderr}",
+                    )
+                    arm_compile = compile_arm_program(source, arm_output)
+                    self.assertEqual(
+                        arm_compile.returncode,
+                        0,
+                        f"ARM compiler failed for {source.name}:\n"
+                        f"{arm_compile.stderr.decode(errors='replace')}",
+                    )
+
+                    env = os.environ.copy()
+                    env["PYTHONDONTWRITEBYTECODE"] = "1"
+                    python_result = subprocess.run(
+                        [sys.executable, str(python_output)],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                        check=False,
+                        env=env,
+                    )
+                    arm_result = subprocess.run(
+                        [
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--platform",
+                            ARM_DOCKER_PLATFORM,
+                            "--volume",
+                            f"{work_dir}:/work",
+                            "--workdir",
+                            "/work",
+                            DOCKER_IMAGE,
+                            "./program.arm",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                        check=False,
+                    )
+
+                    python_stdout, python_r0, _, _, _ = read_python_state(
+                        python_result.stdout
+                    )
+                    self.assertEqual(
+                        python_result.returncode,
+                        expected["exit_status"],
+                        f"Python exit differs for {source.name}",
+                    )
+                    self.assertEqual(arm_result.returncode, expected["exit_status"])
+                    self.assertEqual(arm_result.stdout, expected["stdout"])
+                    self.assertEqual(arm_result.stderr, expected["stderr"])
+                    self.assertEqual(python_stdout, arm_result.stdout)
+                    self.assertEqual(python_result.stderr, arm_result.stderr)
+                    self.assertEqual(python_r0, expected["registers"].get("R0", 0))
+                print(f"  passed: {label}", flush=True)
+
 
 def main():
     suite = unittest.defaultTestLoader.loadTestsFromTestCase(EmitterDifferentialTests)
@@ -336,10 +481,12 @@ def main():
     docker_skip_reasons = [
         reason
         for _, reason in result.skipped
-        if reason.startswith(("Docker is required", "Docker is unavailable"))
+        if reason.startswith(
+            ("Docker is required", "Docker is unavailable", "Docker cannot", "Docker could")
+        )
     ]
     if docker_skip_reasons:
-        print("Docker unavailable; x86 runtime differential tests were skipped:")
+        print("Docker unavailable; native runtime differential tests were skipped:")
         for reason in docker_skip_reasons:
             print(f"  {reason}")
     return 0 if result.wasSuccessful() else 1

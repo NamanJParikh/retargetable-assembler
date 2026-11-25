@@ -17,8 +17,8 @@ unknown labels, and invalid operand counts and types.
 
 ### Emitters
 
-Build `SimpleASM/compile`, then run the combined Python/x86 differential suite
-from the repository root:
+Build `SimpleASM/compile`, then run the combined Python/x86/ARM differential
+suite from the repository root:
 
 ```sh
 python3 SimpleASM/test-scripts/test_emitters.py
@@ -26,17 +26,17 @@ python3 SimpleASM/test-scripts/test_emitters.py
 
 The combined harness reads its complete fixture corpus from
 `emitter-tests/shared/` and `emitter-tests/additional/`; it no longer reads
-fixtures from the separate emitter-specific directories. Each fixture is
-compiled and run through both emitters, comparing process status, program
-output, final registers, condition state, and declared storage. It normalizes
-x86 native data addresses against the Python emulator's byte offsets. Paired
-Python reference scripts and x86 JSON snapshots remain as independent checks.
-Statically invalid accesses and division by zero must be rejected by both
-emitters. The suite also checks invalid memory widths and x86-only register
-restrictions. Docker is required to execute generated x86 ELF files in
-`linux/amd64` containers. The former `test_python_emitter.py` and
-`test_x86_emitter.py` commands remain as compatibility entry points to this
-same suite.
+fixtures from the separate emitter-specific directories. Each valid fixture is
+compiled and run through the Python, x86, and ARM emitters, comparing process
+status and program output. The x86 tests additionally compare final registers,
+condition state, and declared storage using x86 state snapshots, and normalize
+x86 native data addresses against Python byte offsets. ARM runtime tests use
+`linux/arm64` containers and compare observable behavior with the Python
+emulator. Paired Python reference scripts and x86 JSON snapshots remain as
+independent checks. Statically invalid accesses and division by zero must be
+rejected by all emitters. The suite also checks invalid memory widths and
+native-emitter register restrictions. Docker is required to execute generated ELF
+files; x86 tests use `linux/amd64` and ARM tests use `linux/arm64`.
 
 For x86-64 ELF tests on macOS, run the generated executable in an `amd64` Linux
 container. `--x86-state-fd 3` enables a final-state snapshot on inherited file
