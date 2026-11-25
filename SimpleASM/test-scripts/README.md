@@ -54,9 +54,23 @@ registers R0-R15, Rc, and the final program storage bytes.
 Display it from the repository root with:
 
 ```sh
-python3 SimpleASM/test-scripts/show_x86_state.py /tmp/state.bin
+python3 SimpleASM/test-scripts/show_emitter_state.py /tmp/state.bin
 ```
 
 The script prints registers in decimal and hexadecimal and storage in
 offsetted hexadecimal/ASCII rows. If no path is provided, it reads `state.bin`
 from the current directory.
+
+The ARM emitter supports the same snapshot format using
+`--arm-state-fd <fd>`. Since ARM output is written to standard output, redirect
+it to an executable file before running it:
+
+```sh
+SimpleASM/compile --emit arm --arm-state-fd 3 path/to/program.sasm > /tmp/program.arm
+docker run --rm --platform linux/arm64 -v /tmp:/work -w /work ubuntu:24.04 \
+  sh -c 'exec 3>state-arm.bin; exec ./program.arm'
+python3 SimpleASM/test-scripts/show_emitter_state.py /tmp/state-arm.bin
+```
+
+The ARM snapshot includes R0-R15, Rc, and declared program storage, excluding
+its internal spill slots and condition-state storage.

@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-from show_x86_state import read_snapshot
+from show_emitter_state import read_snapshot
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -43,9 +43,13 @@ def compile_program(target, source, output, state_snapshot=False):
     )
 
 
-def compile_arm_program(source, output):
+def compile_arm_program(source, output, state_snapshot=False):
+    command = [str(COMPILER), "--emit", "arm"]
+    if state_snapshot:
+        command.extend(["--arm-state-fd", "3"])
+    command.append(str(source))
     result = subprocess.run(
-        [str(COMPILER), "--emit", "arm", str(source)],
+        command,
         capture_output=True,
         timeout=15,
         check=False,
@@ -146,6 +150,26 @@ def read_writable_segment(path):
         if kind == 1 and flags & 2:
             return virtual_address, memory_size
     raise AssertionError("x86 ELF has no writable load segment")
+
+
+def read_arm_writable_segment(path):
+    image = path.read_bytes()
+    if image[:4] != b"\x7fELF" or image[4] != 2 or image[5] != 1:
+        raise AssertionError("ARM emitter did not produce a little-endian ELF64 executable")
+    if struct.unpack_from("<H", image, 18)[0] != 183:
+        raise AssertionError("ARM ELF does not target AArch64")
+
+    program_header_offset = struct.unpack_from("<Q", image, 32)[0]
+    program_header_size = struct.unpack_from("<H", image, 54)[0]
+    program_header_count = struct.unpack_from("<H", image, 56)[0]
+    for index in range(program_header_count):
+        header_offset = program_header_offset + index * program_header_size
+        kind, flags, _, virtual_address, _, _, memory_size, _ = struct.unpack_from(
+            "<IIQQQQQQ", image, header_offset
+        )
+        if kind == 1 and flags & 2:
+            return virtual_address, memory_size
+    raise AssertionError("ARM ELF has no writable load segment")
 
 
 class EmitterDifferentialTests(unittest.TestCase):
@@ -309,6 +333,7 @@ class EmitterDifferentialTests(unittest.TestCase):
                     x86_result = subprocess.run(
                         [
                             "docker", "run", "--rm", "--platform", "linux/amd64",
+                            "--quiet",
                             "--volume", f"{work_dir}:/work",
                             "--workdir", "/work",
                             DOCKER_IMAGE,
@@ -420,7 +445,9 @@ class EmitterDifferentialTests(unittest.TestCase):
                         0,
                         f"Python compiler failed for {source.name}:\n{python_compile.stderr}",
                     )
-                    arm_compile = compile_arm_program(source, arm_output)
+                    arm_compile = compile_arm_program(
+                        source, arm_output, state_snapshot=True
+                    )
                     self.assertEqual(
                         arm_compile.returncode,
                         0,
@@ -443,6 +470,7 @@ class EmitterDifferentialTests(unittest.TestCase):
                             "docker",
                             "run",
                             "--rm",
+                            "--quiet",
                             "--platform",
                             ARM_DOCKER_PLATFORM,
                             "--volume",
@@ -450,7 +478,9 @@ class EmitterDifferentialTests(unittest.TestCase):
                             "--workdir",
                             "/work",
                             DOCKER_IMAGE,
-                            "./program.arm",
+                            "sh",
+                            "-c",
+                            "exec 3>state.bin; exec ./program.arm",
                         ],
                         capture_output=True,
                         text=True,
@@ -458,7 +488,13 @@ class EmitterDifferentialTests(unittest.TestCase):
                         check=False,
                     )
 
-                    python_stdout, python_r0, _, _, _ = read_python_state(
+                    (
+                        python_stdout,
+                        python_r0,
+                        python_registers,
+                        python_rc,
+                        python_storage,
+                    ) = read_python_state(
                         python_result.stdout
                     )
                     self.assertEqual(
@@ -472,7 +508,90 @@ class EmitterDifferentialTests(unittest.TestCase):
                     self.assertEqual(python_stdout, arm_result.stdout)
                     self.assertEqual(python_result.stderr, arm_result.stderr)
                     self.assertEqual(python_r0, expected["registers"].get("R0", 0))
+                    arm_registers, arm_rc, arm_storage = read_snapshot(
+                        work_dir / "state.bin"
+                    )
+                    self.assertEqual(arm_rc, python_rc)
+                    self.assertEqual(arm_rc, expected["rc"])
+                    self.assertEqual(arm_storage, python_storage[:len(arm_storage)])
+                    self.assertEqual(arm_storage.hex(), expected["storage_hex"])
+                    data_base, data_size = read_arm_writable_segment(arm_output)
+                    for index, arm_value in enumerate(arm_registers):
+                        name = f"R{index}"
+                        python_value = python_registers[name]
+                        expected_value = expected["registers"].get(name, 0)
+                        if data_base <= arm_value < data_base + data_size:
+                            self.assertEqual(
+                                arm_value - data_base,
+                                python_value,
+                                f"ARM address differs for {name}",
+                            )
+                            continue
+                        self.assertEqual(
+                            arm_value,
+                            python_value,
+                            f"ARM {name} differs from Python state",
+                        )
+                        self.assertEqual(
+                            arm_value,
+                            expected_value,
+                            f"ARM reference state differs for {name}",
+                        )
                 print(f"  passed: {label}", flush=True)
+
+    def test_arm_state_snapshot_captures_guest_state_on_exit_and_fallthrough(self):
+        docker_error = docker_unavailable_reason(ARM_DOCKER_PLATFORM)
+        if docker_error:
+            self.skipTest(docker_error)
+
+        with tempfile.TemporaryDirectory(prefix="simpleasm-arm-snapshot-") as temp_dir:
+            work_dir = Path(temp_dir)
+            for ending in ("EXIT\n", ""):
+                with self.subTest(ending=ending or "fallthrough"):
+                    source = work_dir / ("explicit-exit.sasm" if ending else "fallthrough.sasm")
+                    source.write_text(
+                        ".DATA\nVALUE d7\n.CODE\n"
+                        "LI R10, d42\nLI R0, d5\nLI R1, d1\n"
+                        "CMP R1, R0\nST R10, VALUE, d8\n" + ending
+                    )
+                    executable = work_dir / "program.arm"
+                    compile_result = compile_arm_program(
+                        source, executable, state_snapshot=True
+                    )
+                    self.assertEqual(
+                        compile_result.returncode,
+                        0,
+                        compile_result.stderr.decode(errors="replace"),
+                    )
+
+                    run_result = subprocess.run(
+                        [
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--quiet",
+                            "--platform",
+                            ARM_DOCKER_PLATFORM,
+                            "--volume",
+                            f"{work_dir}:/work",
+                            "--workdir",
+                            "/work",
+                            DOCKER_IMAGE,
+                            "sh",
+                            "-c",
+                            "exec 3>state.bin; exec ./program.arm",
+                        ],
+                        capture_output=True,
+                        timeout=60,
+                        check=False,
+                    )
+                    self.assertEqual(run_result.returncode, 5)
+                    registers, condition, storage = read_snapshot(work_dir / "state.bin")
+                    self.assertEqual(registers[0], 5)
+                    self.assertEqual(registers[1], 1)
+                    self.assertEqual(registers[10], 42)
+                    self.assertEqual(condition, 1)
+                    self.assertEqual(storage, (42).to_bytes(8, "little"))
 
 
 def main():
