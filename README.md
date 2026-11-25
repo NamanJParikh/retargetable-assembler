@@ -1,6 +1,158 @@
-# My Little Compiler
+# Retargetable Assembly
 
-## Intro (personal, not technical)
+SimpleASM is a small educational compiler for a register-based assembly-like
+language. It parses one program into a shared intermediate representation, then
+emits a runnable Python emulator or native Linux executables for x86-64 and
+AArch64. The project is intended to explore compiler backends, machine
+instructions, executable formats, and testing techniques.
+
+## Features
+
+- A compact but powerful language with `.DATA` and `.CODE` sections, 16 64-bit general
+  registers (`R0`-`R15`), a persistent condition register (`Rc`), and
+  arithmetic, memory, branching, and text-output instructions.
+- One parser and program representation shared by independent emitters.
+- Native x86-64 and AArch64 Linux ELF64 output, generated directly by the
+  compiler without invoking an assembler or linker.
+- A Python emitter that produces a readable, runnable emulator and reports the
+  final guest registers and storage.
+- Conservative compile-time rejection of statically provable out-of-bounds
+  memory/text accesses and division by a known zero divisor.
+
+The supported emitters are `python`, `x86`, and `arm`. IBM Z is listed as a
+future target but is not implemented yet.
+
+## Build
+
+From the repository root, build the C++17 compiler with `clang++`, `g++`, or
+another C++17 compiler:
+
+```sh
+c++ -std=c++17 -O2 SimpleASM/compiler.cpp -o SimpleASM/compile
+```
+
+## Quick start
+
+Create a small program:
+
+```sh
+cat > /tmp/hello.sasm <<'EOF'
+.DATA
+MESSAGE t'Hello from SimpleASM!'
+.CODE
+START LI R0, d0
+      WRTE MESSAGE
+      EXIT
+EOF
+```
+
+Use the Python emitter to generate and run an emulator:
+
+```sh
+./SimpleASM/compile --emit python /tmp/hello.sasm
+python3 /tmp/hello.py
+```
+
+The generated Python script writes the program's text to standard output, then
+prints its final register and storage state. The process status is the low byte
+of `R0`.
+
+To inspect the parsed program without generating a target:
+
+```sh
+./SimpleASM/compile --emit print /tmp/hello.sasm
+```
+
+## Emitters and output
+
+```sh
+# Python source: writes /tmp/hello.py by default
+./SimpleASM/compile --emit python /tmp/hello.sasm
+
+# Native x86-64 Linux ELF: writes /tmp/hello-x86.out
+./SimpleASM/compile --emit x86 -o /tmp/hello-x86.out /tmp/hello.sasm
+
+# Native AArch64 Linux ELF: binary output goes to stdout
+./SimpleASM/compile --emit arm /tmp/hello.sasm > /tmp/hello-arm
+chmod +x /tmp/hello-arm
+```
+
+Python and x86 output paths can also be selected with `-o` or `--output`.
+`--emit arm` writes the ELF image to standard output so it can be redirected
+to a file. The native targets are Linux executables: run x86 output on
+x86-64 Linux and ARM output on AArch64 Linux. On other hosts, a suitably
+configured Linux container or emulator can be used. For example, with Docker:
+
+```sh
+docker run --rm --platform linux/arm64 \
+  --volume /tmp:/work --workdir /work ubuntu:24.04 ./hello-arm
+```
+
+Use `--help` for the command-line options. The `--x86-state-fd <fd>` and
+`--arm-state-fd <fd>` options enable optional final-state snapshots on an
+inherited file descriptor for debugging; both use the same binary snapshot
+format.
+
+## Design highlights
+
+### Retargetable front end
+
+The parser converts source into a `Program` containing ordered data entries,
+instructions, operands, and a symbol table. Emitters consume that shared
+representation through a common interface, keeping parsing and language
+semantics separate from target instruction encoding. This makes it possible
+to compare different backends on the same input without changing the source
+program.
+
+### Register spilling
+
+The guest language exposes 16 general registers, more than either backend can
+dedicate safely to guest values while also reserving native registers for
+address calculations, arithmetic, and Linux system calls.
+
+- The x86-64 emitter maps guest `R0`-`R8` directly to native registers and
+  stores `R9`-`R15` in zero-initialized eight-byte slots in the writable data
+  segment.
+- The AArch64 emitter maps `R0`-`R9` to `X19`-`X28`, which survive Linux system
+  calls, and spills `R10`-`R15` to six eight-byte slots after declared program
+  storage.
+
+Spilled values are loaded into scratch registers when needed and written back
+when modified. The condition register is stored separately so comparisons
+remain observable by later conditional branches. Internal spill and condition
+slots are excluded from guest storage snapshots.
+
+### Python as a differential reference
+
+The Python emitter implements the same 64-bit register and memory model in
+generated, inspectable Python code. The emitter test suite runs shared
+SimpleASM fixtures through Python, x86, and ARM, comparing output, exit status,
+registers, condition state, and storage. This provides a portable reference
+for validating native backends, including register spilling and memory
+behavior.
+
+## Tests
+
+Run the parser and emitter suites from the repository root:
+
+```sh
+python3 SimpleASM/test-scripts/test_parser.py
+python3 SimpleASM/test-scripts/test_emitters.py
+```
+
+The emitter suite uses Docker to run the native Linux executables (`linux/amd64`
+for x86 and `linux/arm64` for ARM); Docker is not required for the parser
+suite. More details about fixtures, snapshots, and test behavior are in
+[`SimpleASM/test-scripts/README.md`](SimpleASM/test-scripts/README.md).
+
+## Repository note
+
+The `kaleidoscope/` directory contains the separate LLVM Kaleidoscope tutorial
+compiler. This project began as an exploration into LLVM and compilers and evolved into SimpleASM.
+
+# Personal Notes (taken throughout the project)
+
+## Intro
 
 So I decided to make some compilers. This is primarily an educational project for 
 me, so the goal is to cover a lot of breadth and make working programs, not
