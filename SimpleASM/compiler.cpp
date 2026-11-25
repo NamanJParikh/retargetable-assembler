@@ -1484,11 +1484,859 @@ class X86Emitter final : public Emitter {
         }
 };
 
-class ARMEmitter final : public Emitter {
+class ARMCodeGenerator {
+    private:
+        struct AddressFixup {
+            std::size_t adrpOffset;
+            std::size_t addOffset;
+            int64_t dataOffset;
+        };
+        struct BranchFixup {
+            std::size_t instructionOffset;
+            std::string label;
+            int condition;
+        };
+
+        static constexpr int DirectGuestRegisterCount = 10;
+        static constexpr int GuestRegisterCount = 16;
+        static constexpr int FirstDirectRegister = 19;
+        static constexpr int AddressRegister = 16;
+        static constexpr int ScratchRegister = 17;
+        static constexpr std::size_t CodeFileOffset = 0x1000;
+        static constexpr uint64_t ImageBase = 0x400000;
+        static constexpr std::size_t SnapshotHeaderSize = 16 + GuestRegisterCount * 8 + 8;
+
+        const Program& program_;
+        std::optional<int> stateSnapshotFd_;
+        std::vector<uint8_t> code_;
+        std::vector<uint8_t> data_;
+        std::map<std::string, std::size_t> dataLabels_;
+        std::map<std::string, std::size_t> codeLabels_;
+        std::vector<AddressFixup> addressFixups_;
+        std::vector<BranchFixup> branchFixups_;
+        std::size_t programDataSize_ = 0;
+        std::size_t conditionOffset_ = 0;
+        std::size_t snapshotOffset_ = 0;
+
+        static void append32(std::vector<uint8_t>& output, uint32_t value) {
+            for (unsigned int shift = 0; shift < 32; shift += 8) {
+                output.push_back(static_cast<uint8_t>(value >> shift));
+            }
+        }
+
+        static void append64(std::vector<uint8_t>& output, uint64_t value) {
+            for (unsigned int shift = 0; shift < 64; shift += 8) {
+                output.push_back(static_cast<uint8_t>(value >> shift));
+            }
+        }
+
+        static void write16(std::vector<uint8_t>& output, std::size_t offset, uint16_t value) {
+            for (unsigned int shift = 0; shift < 16; shift += 8) {
+                output[offset + shift / 8] = static_cast<uint8_t>(value >> shift);
+            }
+        }
+
+        static void write32(std::vector<uint8_t>& output, std::size_t offset, uint32_t value) {
+            for (unsigned int shift = 0; shift < 32; shift += 8) {
+                output[offset + shift / 8] = static_cast<uint8_t>(value >> shift);
+            }
+        }
+
+        static void write64(std::vector<uint8_t>& output, std::size_t offset, uint64_t value) {
+            for (unsigned int shift = 0; shift < 64; shift += 8) {
+                output[offset + shift / 8] = static_cast<uint8_t>(value >> shift);
+            }
+        }
+
+        static const Operand& operandAt(const Instruction& instruction, std::size_t index) {
+            if (index >= instruction.operands.size()) {
+                throw std::invalid_argument(opcodeName(instruction.opcode) + " has too few operands");
+            }
+            return instruction.operands[index];
+        }
+
+        static void requireOperandCount(const Instruction& instruction, std::size_t count) {
+            if (instruction.operands.size() != count) {
+                throw std::invalid_argument(opcodeName(instruction.opcode) + " requires " +
+                                            std::to_string(count) + " operands");
+            }
+        }
+
+        int guestRegisterIndex(const Instruction& instruction, std::size_t index) const {
+            const auto* reg = std::get_if<Register>(&operandAt(instruction, index));
+            if (!reg || *reg == Register::Rc) {
+                throw std::invalid_argument(opcodeName(instruction.opcode) + " operand " +
+                                            std::to_string(index + 1) + " must be a general register");
+            }
+            const int guestIndex = static_cast<int>(*reg);
+            if (guestIndex < 0 || guestIndex >= GuestRegisterCount) {
+                throw std::invalid_argument("Invalid SimpleASM general register");
+            }
+            return guestIndex;
+        }
+
+        static int64_t immediate(const Instruction& instruction, std::size_t index) {
+            const auto* value = std::get_if<Immediate>(&operandAt(instruction, index));
+            if (!value || value->type == Type::Text) {
+                throw std::invalid_argument(opcodeName(instruction.opcode) + " operand " +
+                                            std::to_string(index + 1) + " must be a numeric immediate");
+            }
+            return value->numericalValue;
+        }
+
+        const Address& address(const Instruction& instruction, std::size_t index) const {
+            const auto* value = std::get_if<Address>(&operandAt(instruction, index));
+            if (!value || (!value->label && !value->baseRegister)) {
+                throw std::invalid_argument(opcodeName(instruction.opcode) + " operand " +
+                                            std::to_string(index + 1) + " must be an address");
+            }
+            if (value->label && dataLabels_.find(*value->label) == dataLabels_.end()) {
+                throw std::invalid_argument("Unknown data label in address: " + *value->label);
+            }
+            if (value->baseRegister &&
+                static_cast<int>(*value->baseRegister) >= GuestRegisterCount) {
+                throw std::invalid_argument("Invalid SimpleASM address base register");
+            }
+            return *value;
+        }
+
+        static int nativeRegister(int guestIndex) {
+            if (guestIndex < 0 || guestIndex >= DirectGuestRegisterCount) {
+                throw std::logic_error("Invalid directly mapped SimpleASM register");
+            }
+            return FirstDirectRegister + guestIndex;
+        }
+
+        static uint32_t threeRegister(uint32_t opcode, int destination, int left, int right) {
+            return opcode | (static_cast<uint32_t>(right) << 16) |
+                   (static_cast<uint32_t>(left) << 5) |
+                   static_cast<uint32_t>(destination);
+        }
+
+        static uint32_t addImmediate(int destination, int base, uint16_t value,
+                                     bool subtract = false) {
+            return (subtract ? 0xD1000000U : 0x91000000U) |
+                   (static_cast<uint32_t>(value) << 10) |
+                   (static_cast<uint32_t>(base) << 5) |
+                   static_cast<uint32_t>(destination);
+        }
+
+        void emit(uint32_t instruction) {
+            append32(code_, instruction);
+        }
+
+        static uint32_t moveWide(int destination, uint16_t value, int shift, bool keep) {
+            return (keep ? 0xF2800000U : 0xD2800000U) |
+                   (static_cast<uint32_t>(shift / 16) << 21) |
+                   (static_cast<uint32_t>(value) << 5) |
+                   static_cast<uint32_t>(destination);
+        }
+
+        void emitLoadImmediate(int destination, uint64_t value) {
+            bool emitted = false;
+            for (int shift = 0; shift < 64; shift += 16) {
+                const uint16_t part = static_cast<uint16_t>(value >> shift);
+                if (part != 0 || !emitted) {
+                    emit(moveWide(destination, part, shift, emitted));
+                    emitted = true;
+                }
+            }
+        }
+
+        void emitMove(int destination, int source) {
+            emit(threeRegister(0xAA0003E0U, destination, 31, source));
+        }
+
+        void emitAdd(int destination, int left, int right) {
+            emit(threeRegister(0x8B000000U, destination, left, right));
+        }
+
+        void emitSubtract(int destination, int left, int right) {
+            emit(threeRegister(0xCB000000U, destination, left, right));
+        }
+
+        void emitCompare(int left, int right) {
+            emit(threeRegister(0xEB00001FU, 31, left, right));
+        }
+
+        void emitCompareZero(int reg) {
+            emitCompare(reg, 31);
+        }
+
+        void emitCompareWordImmediateZero(int reg) {
+            emit(0x7100001FU | (static_cast<uint32_t>(reg) << 5));
+        }
+
+        std::size_t spillOffset(int guestIndex) const {
+            if (guestIndex < DirectGuestRegisterCount || guestIndex >= GuestRegisterCount) {
+                throw std::logic_error("Invalid spilled SimpleASM register");
+            }
+            return programDataSize_ + static_cast<std::size_t>(
+                guestIndex - DirectGuestRegisterCount) * 8;
+        }
+
+        void emitDataAddress(int destination, int64_t dataOffset) {
+            const std::size_t adrpOffset = code_.size();
+            emit(0x90000000U | static_cast<uint32_t>(destination));
+            const std::size_t addOffset = code_.size();
+            emit(addImmediate(destination, destination, 0));
+            addressFixups_.push_back({adrpOffset, addOffset, dataOffset});
+        }
+
+        void emitLoadGuestRegister(int guestIndex, int nativeDestination) {
+            if (guestIndex < DirectGuestRegisterCount) {
+                emitMove(nativeDestination, nativeRegister(guestIndex));
+                return;
+            }
+            emitDataAddress(ScratchRegister, static_cast<int64_t>(spillOffset(guestIndex)));
+            emit(0xF9400000U | (static_cast<uint32_t>(ScratchRegister) << 5) |
+                 static_cast<uint32_t>(nativeDestination));
+        }
+
+        void emitStoreGuestRegister(int guestIndex, int nativeSource) {
+            if (guestIndex < DirectGuestRegisterCount) {
+                emitMove(nativeRegister(guestIndex), nativeSource);
+                return;
+            }
+            emitDataAddress(ScratchRegister, static_cast<int64_t>(spillOffset(guestIndex)));
+            emit(0xF9000000U | (static_cast<uint32_t>(ScratchRegister) << 5) |
+                 static_cast<uint32_t>(nativeSource));
+        }
+
+        void emitLoadCondition(int destination) {
+            emitDataAddress(ScratchRegister, static_cast<int64_t>(conditionOffset_));
+            emit(0xF9400000U | (static_cast<uint32_t>(ScratchRegister) << 5) |
+                 static_cast<uint32_t>(destination));
+        }
+
+        void emitStoreCondition(int source) {
+            emitDataAddress(ScratchRegister, static_cast<int64_t>(conditionOffset_));
+            emit(0xF9000000U | (static_cast<uint32_t>(ScratchRegister) << 5) |
+                 static_cast<uint32_t>(source));
+        }
+
+        void emitAddress(const Address& value, int destination) {
+            if (value.label) {
+                const auto label = dataLabels_.find(*value.label);
+                if (label == dataLabels_.end()) {
+                    throw std::invalid_argument("Unknown data label in address: " + *value.label);
+                }
+                if (label->second > static_cast<std::size_t>(INT64_MAX)) {
+                    throw std::invalid_argument("Data-label displacement overflow");
+                }
+                const int64_t labelOffset = static_cast<int64_t>(label->second);
+                if (value.displacement > 0 &&
+                    labelOffset > INT64_MAX - value.displacement) {
+                    throw std::invalid_argument("Data-label displacement overflow");
+                }
+                const int64_t offset = labelOffset + value.displacement;
+                emitDataAddress(destination, offset);
+                return;
+            }
+
+            const int base = static_cast<int>(*value.baseRegister);
+            emitLoadGuestRegister(base, ScratchRegister);
+            if (value.displacement == 0) {
+                emitMove(destination, ScratchRegister);
+            } else {
+                const uint64_t magnitude = value.displacement < 0
+                    ? static_cast<uint64_t>(-(value.displacement + 1)) + 1
+                    : static_cast<uint64_t>(value.displacement);
+                emitLoadImmediate(9, magnitude);
+                emit(threeRegister(value.displacement < 0 ? 0xCB000000U : 0x8B000000U,
+                                   destination, ScratchRegister, 9));
+            }
+        }
+
+        void emitLoadByte(int destination, int base, uint16_t offset) {
+            emit(0x39400000U | (static_cast<uint32_t>(offset) << 10) |
+                 (static_cast<uint32_t>(base) << 5) |
+                 static_cast<uint32_t>(destination));
+        }
+
+        void emitStoreByte(int source, int base, uint16_t offset) {
+            emit(0x39000000U | (static_cast<uint32_t>(offset) << 10) |
+                 (static_cast<uint32_t>(base) << 5) |
+                 static_cast<uint32_t>(source));
+        }
+
+        void emitBranch(int condition, const std::string& label) {
+            const std::size_t offset = code_.size();
+            emit(condition < 0 ? 0x14000000U : 0x54000000U |
+                 static_cast<uint32_t>(condition));
+            branchFixups_.push_back({offset, label, condition});
+        }
+
+        static uint32_t branchInstruction(std::size_t instructionOffset,
+                                          std::size_t targetOffset, int condition) {
+            const int64_t byteDelta = static_cast<int64_t>(targetOffset) -
+                                      static_cast<int64_t>(instructionOffset);
+            if ((byteDelta & 3) != 0) {
+                throw std::logic_error("ARM branch target is not instruction-aligned");
+            }
+            const int64_t wordDelta = byteDelta / 4;
+            if (condition < 0) {
+                if (wordDelta < -(INT64_C(1) << 25) ||
+                    wordDelta >= (INT64_C(1) << 25)) {
+                    throw std::invalid_argument("ARM code-label branch is out of range");
+                }
+                return 0x14000000U | (static_cast<uint32_t>(wordDelta) & 0x03FFFFFFU);
+            }
+            if (wordDelta < -(INT64_C(1) << 18) ||
+                wordDelta >= (INT64_C(1) << 18)) {
+                throw std::invalid_argument("ARM conditional branch is out of range");
+            }
+            return 0x54000000U |
+                   ((static_cast<uint32_t>(wordDelta) & 0x7FFFFU) << 5) |
+                   static_cast<uint32_t>(condition);
+        }
+
+        void patchLocalBranch(std::size_t instructionOffset, std::size_t targetOffset,
+                              int condition, const std::string&) {
+            const uint32_t value = branchInstruction(instructionOffset, targetOffset, condition);
+            for (unsigned int shift = 0; shift < 32; shift += 8) {
+                code_[instructionOffset + shift / 8] = static_cast<uint8_t>(value >> shift);
+            }
+        }
+
+        std::size_t emitLocalBranchPlaceholder(int condition) {
+            const std::size_t offset = code_.size();
+            emit(condition < 0 ? 0x14000000U : 0x54000000U |
+                 static_cast<uint32_t>(condition));
+            return offset;
+        }
+
+        std::string branchLabel(const Instruction& instruction, std::size_t index) const {
+            const Operand& operand = operandAt(instruction, index);
+            std::string label;
+            if (const auto* value = std::get_if<Address>(&operand); value && value->label) {
+                label = *value->label;
+            } else if (const auto* text = std::get_if<std::string>(&operand)) {
+                label = *text;
+            } else {
+                throw std::invalid_argument(opcodeName(instruction.opcode) + " operand " +
+                                            std::to_string(index + 1) + " must be a code label");
+            }
+            const bool exists = std::any_of(program_.codeSection.begin(), program_.codeSection.end(),
+                [&](const Instruction& candidate) {
+                    return candidate.label && *candidate.label == label;
+                });
+            if (!exists) {
+                throw std::invalid_argument("Unknown code label: " + label);
+            }
+            return label;
+        }
+
+        uint8_t branchCondition(const Instruction& instruction, std::size_t index) const {
+            const Operand& operand = operandAt(instruction, index);
+            int64_t value = -1;
+            if (const auto* text = std::get_if<std::string>(&operand)) {
+                if (text->size() == 2 &&
+                    std::all_of(text->begin(), text->end(), [](char ch) {
+                        return ch == '0' || ch == '1';
+                    })) {
+                    value = ((*text)[0] - '0') * 2 + ((*text)[1] - '0');
+                } else if (text->size() == 1 && (*text == "0" || *text == "1")) {
+                    value = (*text)[0] - '0';
+                }
+            } else if (const auto* imm = std::get_if<Immediate>(&operand);
+                       imm && imm->type != Type::Text) {
+                value = imm->numericalValue;
+            }
+            if (value < 0 || value > 3) {
+                throw std::invalid_argument("BRC condition must be between 0 and 3");
+            }
+            return static_cast<uint8_t>(value);
+        }
+
+        void emitStore(const Instruction& instruction) {
+            const int sourceRegister = guestRegisterIndex(instruction, 0);
+            const Address& destination = address(instruction, 1);
+            const int64_t size = immediate(instruction, 2);
+            if (size < 1 || size > 8) {
+                throw std::invalid_argument("ST size must be between 1 and 8 bytes");
+            }
+
+            emitAddress(destination, AddressRegister);
+            emitLoadGuestRegister(sourceRegister, 9);
+            for (int64_t byte = 0; byte < size; ++byte) {
+                emitStoreByte(9, AddressRegister, static_cast<uint16_t>(byte));
+                if (byte + 1 < size) {
+                    emit(0xD348FC00U | (9U << 5) | 9U); // lsr x9, x9, #8
+                }
+            }
+        }
+
+        void emitTextWrite(const Instruction& instruction) {
+            emitAddress(address(instruction, 0), AddressRegister);
+            emitMove(9, AddressRegister);
+            emitMove(10, AddressRegister);
+            emitLoadImmediate(11, 0);
+
+            const std::size_t scanLoop = code_.size();
+            emitLoadByte(12, 10, 0);
+            emitCompareWordImmediateZero(12);
+            const std::size_t scanDone = emitLocalBranchPlaceholder(0);
+            emit(addImmediate(10, 10, 1));
+            emit(addImmediate(11, 11, 1));
+            const std::size_t scanAgain = emitLocalBranchPlaceholder(-1);
+            patchLocalBranch(scanAgain, scanLoop, -1, "ARM WRTE scan loop");
+
+            const std::size_t writeLoop = code_.size();
+            emitLoadImmediate(0, 1);
+            emitMove(1, 9);
+            emitMove(2, 11);
+            emitLoadImmediate(8, 64);
+            emit(0xD4000001U); // svc #0, Linux write
+            emitCompareZero(0);
+            const std::size_t zeroWrite = emitLocalBranchPlaceholder(0);
+            const std::size_t errorBranch = emitLocalBranchPlaceholder(11);
+            emitAdd(9, 9, 0);
+            emitSubtract(11, 11, 0);
+            emitCompareZero(11);
+            const std::size_t moreBytes = emitLocalBranchPlaceholder(1);
+            const std::size_t completed = emitLocalBranchPlaceholder(-1);
+            const std::size_t errorHandling = code_.size();
+            emitLoadImmediate(10, static_cast<uint64_t>(-4));
+            emitCompare(0, 10);
+            const std::size_t notInterrupted = emitLocalBranchPlaceholder(1);
+            const std::size_t retry = emitLocalBranchPlaceholder(-1);
+            const std::size_t done = code_.size();
+            patchLocalBranch(scanDone, writeLoop, 0, "ARM WRTE scan exit");
+            patchLocalBranch(zeroWrite, done, 0, "ARM WRTE zero-write branch");
+            patchLocalBranch(errorBranch, errorHandling, 11, "ARM WRTE error branch");
+            patchLocalBranch(moreBytes, writeLoop, 1, "ARM WRTE partial-write branch");
+            patchLocalBranch(completed, done, -1, "ARM WRTE completion branch");
+            patchLocalBranch(notInterrupted, done, 1, "ARM WRTE EINTR branch");
+            patchLocalBranch(retry, writeLoop, -1, "ARM WRTE retry branch");
+            (void)scanLoop;
+        }
+
+        void emitStateWrite(int fd, uint64_t length) {
+            if (length == 0) {
+                throw std::logic_error("Cannot emit an empty state snapshot write");
+            }
+            emitLoadImmediate(10, length);
+            const std::size_t writeLoop = code_.size();
+            emitLoadImmediate(0, static_cast<uint64_t>(fd));
+            emitMove(1, 9);
+            emitMove(2, 10);
+            emitLoadImmediate(8, 64);
+            emit(0xD4000001U);
+            emitCompareZero(0);
+            const std::size_t zeroWrite = emitLocalBranchPlaceholder(0);
+            const std::size_t errorBranch = emitLocalBranchPlaceholder(11);
+            emitAdd(9, 9, 0);
+            emitSubtract(10, 10, 0);
+            emitCompareZero(10);
+            const std::size_t moreBytes = emitLocalBranchPlaceholder(1);
+            const std::size_t completed = emitLocalBranchPlaceholder(-1);
+            const std::size_t errorHandling = code_.size();
+            emitLoadImmediate(11, static_cast<uint64_t>(-4));
+            emitCompare(0, 11);
+            const std::size_t notInterrupted = emitLocalBranchPlaceholder(1);
+            const std::size_t retry = emitLocalBranchPlaceholder(-1);
+            const std::size_t error = code_.size();
+            emitLoadImmediate(0, 255);
+            emitLoadImmediate(8, 93);
+            emit(0xD4000001U);
+            const std::size_t done = code_.size();
+            patchLocalBranch(zeroWrite, error, 0, "ARM snapshot zero-write branch");
+            patchLocalBranch(errorBranch, errorHandling, 11, "ARM snapshot error branch");
+            patchLocalBranch(moreBytes, writeLoop, 1, "ARM snapshot partial-write branch");
+            patchLocalBranch(completed, done, -1, "ARM snapshot completion branch");
+            patchLocalBranch(notInterrupted, error, 1, "ARM snapshot EINTR branch");
+            patchLocalBranch(retry, writeLoop, -1, "ARM snapshot retry branch");
+        }
+
+        void emitStateSnapshot() {
+            if (!stateSnapshotFd_) {
+                return;
+            }
+
+            emitDataAddress(16, static_cast<int64_t>(snapshotOffset_));
+            for (int guest = 0; guest < GuestRegisterCount; ++guest) {
+                int source = 9;
+                if (guest < DirectGuestRegisterCount) {
+                    source = nativeRegister(guest);
+                } else {
+                    emitLoadGuestRegister(guest, source);
+                }
+                const uint16_t offset = static_cast<uint16_t>(16 + guest * 8);
+                emit(0xF9000000U | (static_cast<uint32_t>(offset / 8) << 10) |
+                     (16U << 5) | static_cast<uint32_t>(source));
+            }
+            emitLoadCondition(9);
+            emit(0xF9000000U |
+                 (static_cast<uint32_t>((16 + GuestRegisterCount * 8) / 8) << 10) |
+                 (16U << 5) | 9U);
+
+            emitDataAddress(9, static_cast<int64_t>(snapshotOffset_));
+            emitStateWrite(*stateSnapshotFd_, SnapshotHeaderSize);
+            if (programDataSize_ != 0) {
+                emitDataAddress(9, 0);
+                emitStateWrite(*stateSnapshotFd_, programDataSize_);
+            }
+        }
+
+        void emitExit() {
+            emitStateSnapshot();
+            emitMove(0, nativeRegister(0));
+            emitLoadImmediate(8, 93); // Linux AArch64 exit
+            emit(0xD4000001U);
+        }
+
+        void emitInstruction(const Instruction& instruction) {
+            auto binary = [&](uint32_t opcode) {
+                requireOperandCount(instruction, 2);
+                const int destination = guestRegisterIndex(instruction, 0);
+                const int source = guestRegisterIndex(instruction, 1);
+                emitLoadGuestRegister(destination, 9);
+                emitLoadGuestRegister(source, 10);
+                emit(threeRegister(opcode, 9, 9, 10));
+                emitStoreGuestRegister(destination, 9);
+            };
+
+            switch (instruction.opcode) {
+                case Opcode::LI: {
+                    requireOperandCount(instruction, 2);
+                    const int destination = guestRegisterIndex(instruction, 0);
+                    emitLoadImmediate(9, static_cast<uint64_t>(immediate(instruction, 1)));
+                    emitStoreGuestRegister(destination, 9);
+                    break;
+                }
+                case Opcode::LR: {
+                    requireOperandCount(instruction, 2);
+                    const int destination = guestRegisterIndex(instruction, 0);
+                    const int source = guestRegisterIndex(instruction, 1);
+                    emitLoadGuestRegister(source, 9);
+                    emitStoreGuestRegister(destination, 9);
+                    break;
+                }
+                case Opcode::LA: {
+                    requireOperandCount(instruction, 2);
+                    const int destination = guestRegisterIndex(instruction, 0);
+                    emitAddress(address(instruction, 1), 9);
+                    emitStoreGuestRegister(destination, 9);
+                    break;
+                }
+                case Opcode::LMU:
+                case Opcode::LMS: {
+                    requireOperandCount(instruction, 3);
+                    const int destination = guestRegisterIndex(instruction, 0);
+                    const Address& source = address(instruction, 1);
+                    const int64_t size = immediate(instruction, 2);
+                    if (size < 1 || size > 8) {
+                        throw std::invalid_argument(opcodeName(instruction.opcode) +
+                                                    " size must be between 1 and 8 bytes");
+                    }
+                    emitAddress(source, AddressRegister);
+                    emitLoadImmediate(9, 0);
+                    for (int64_t byte = 0; byte < size; ++byte) {
+                        emitLoadByte(10, AddressRegister, static_cast<uint16_t>(byte));
+                        if (byte != 0) {
+                            const int shift = static_cast<int>(byte * 8);
+                            const int rotate = (64 - shift) & 63;
+                            const int lastBit = 63 - shift;
+                            emit(0xD3400000U |
+                                 (static_cast<uint32_t>(rotate) << 16) |
+                                 (static_cast<uint32_t>(lastBit) << 10) |
+                                 (10U << 5) | 10U);
+                        }
+                        emit(threeRegister(0xAA000000U, 9, 9, 10));
+                    }
+                    if (instruction.opcode == Opcode::LMS && size < 8) {
+                        const int lastBit = static_cast<int>(size * 8) - 1;
+                        emit(0x93400000U |
+                             (static_cast<uint32_t>(lastBit) << 10) |
+                             (9U << 5) | 9U);
+                    }
+                    emitStoreGuestRegister(destination, 9);
+                    break;
+                }
+                case Opcode::ST:
+                    requireOperandCount(instruction, 3);
+                    emitStore(instruction);
+                    break;
+                case Opcode::AND: binary(0x8A000000U); break;
+                case Opcode::OR: binary(0xAA000000U); break;
+                case Opcode::XOR: binary(0xCA000000U); break;
+                case Opcode::ADD: binary(0x8B000000U); break;
+                case Opcode::SUB: binary(0xCB000000U); break;
+                case Opcode::MUL:
+                case Opcode::MULS:
+                    binary(0x9B007C00U);
+                    break;
+                case Opcode::DIV:
+                case Opcode::DIVS: {
+                    requireOperandCount(instruction, 2);
+                    const int destination = guestRegisterIndex(instruction, 0);
+                    const int divisor = guestRegisterIndex(instruction, 1);
+                    emitLoadGuestRegister(destination, 9);
+                    emitLoadGuestRegister(divisor, 10);
+                    emitCompareZero(10);
+                    const std::size_t nonzero = emitLocalBranchPlaceholder(1);
+                    emit(0xD4200000U); // brk #0, matching native divide-by-zero failure
+                    patchLocalBranch(nonzero, code_.size(), 1, "ARM division-by-zero guard");
+                    emit(threeRegister(instruction.opcode == Opcode::DIV
+                                           ? 0x9AC00800U : 0x9AC00C00U,
+                                       9, 9, 10));
+                    emitStoreGuestRegister(destination, 9);
+                    break;
+                }
+                case Opcode::ADDI:
+                case Opcode::SUBI: {
+                    requireOperandCount(instruction, 2);
+                    const int destination = guestRegisterIndex(instruction, 0);
+                    emitLoadGuestRegister(destination, 9);
+                    emitLoadImmediate(10, static_cast<uint64_t>(immediate(instruction, 1)));
+                    emit(threeRegister(instruction.opcode == Opcode::ADDI
+                                           ? 0x8B000000U : 0xCB000000U,
+                                       9, 9, 10));
+                    emitStoreGuestRegister(destination, 9);
+                    break;
+                }
+                case Opcode::LSH:
+                case Opcode::RSH:
+                case Opcode::RSHS: {
+                    requireOperandCount(instruction, 2);
+                    const int destination = guestRegisterIndex(instruction, 0);
+                    const int64_t shift = immediate(instruction, 1);
+                    if (shift < 0 || shift > 63) {
+                        throw std::invalid_argument("Shift must be between 0 and 63");
+                    }
+                    emitLoadGuestRegister(destination, 9);
+                    emitLoadImmediate(10, static_cast<uint64_t>(shift));
+                    const uint32_t operation = instruction.opcode == Opcode::LSH ? 0x9AC02000U :
+                        instruction.opcode == Opcode::RSH ? 0x9AC02400U : 0x9AC02800U;
+                    emit(threeRegister(operation, 9, 9, 10));
+                    emitStoreGuestRegister(destination, 9);
+                    break;
+                }
+                case Opcode::CMP:
+                case Opcode::CMPS: {
+                    requireOperandCount(instruction, 2);
+                    const int lhs = guestRegisterIndex(instruction, 0);
+                    const int rhs = guestRegisterIndex(instruction, 1);
+                    emitLoadGuestRegister(lhs, 9);
+                    emitLoadGuestRegister(rhs, 10);
+                    emitCompare(9, 10);
+                    const int lessCondition = instruction.opcode == Opcode::CMP ? 3 : 11;
+                    const std::size_t equal = emitLocalBranchPlaceholder(0);
+                    const std::size_t less = emitLocalBranchPlaceholder(lessCondition);
+                    emitLoadImmediate(9, 2);
+                    emitStoreCondition(9);
+                    const std::size_t greaterDone = emitLocalBranchPlaceholder(-1);
+                    const std::size_t lessOffset = code_.size();
+                    emitLoadImmediate(9, 1);
+                    emitStoreCondition(9);
+                    const std::size_t lessDone = emitLocalBranchPlaceholder(-1);
+                    const std::size_t equalOffset = code_.size();
+                    emitLoadImmediate(9, 0);
+                    emitStoreCondition(9);
+                    const std::size_t done = code_.size();
+                    patchLocalBranch(equal, equalOffset, 0, "ARM comparison equal branch");
+                    patchLocalBranch(less, lessOffset, lessCondition, "ARM comparison less branch");
+                    patchLocalBranch(greaterDone, done, -1, "ARM comparison greater branch");
+                    patchLocalBranch(lessDone, done, -1, "ARM comparison less completion");
+                    break;
+                }
+                case Opcode::BRU:
+                    requireOperandCount(instruction, 1);
+                    emitBranch(-1, branchLabel(instruction, 0));
+                    break;
+                case Opcode::BRC: {
+                    requireOperandCount(instruction, 2);
+                    const uint8_t condition = branchCondition(instruction, 1);
+                    emitLoadCondition(9);
+                    emitLoadImmediate(10, condition);
+                    emitCompare(9, 10);
+                    const std::size_t notTaken = emitLocalBranchPlaceholder(1);
+                    emitBranch(-1, branchLabel(instruction, 0));
+                    patchLocalBranch(notTaken, code_.size(), 1, "ARM conditional branch skip");
+                    break;
+                }
+                case Opcode::WRTE:
+                    requireOperandCount(instruction, 1);
+                    emitTextWrite(instruction);
+                    break;
+                case Opcode::EXIT:
+                    requireOperandCount(instruction, 0);
+                    emitExit();
+                    break;
+                case Opcode::DEF:
+                    throw std::invalid_argument("DEF must be represented in the data section");
+            }
+        }
+
+        void buildData() {
+            for (const auto& entry : program_.dataSection) {
+                if (!entry.label.empty()) {
+                    dataLabels_[entry.label] = data_.size();
+                }
+                if (entry.value.type == Type::Text) {
+                    for (unsigned char byte : entry.value.textValue) {
+                        data_.push_back(byte);
+                    }
+                    data_.push_back(0);
+                } else {
+                    append64(data_, static_cast<uint64_t>(entry.value.numericalValue));
+                }
+            }
+            programDataSize_ = data_.size();
+            if (stateSnapshotFd_ && programDataSize_ > UINT32_MAX) {
+                throw std::invalid_argument("ARM state snapshots support at most 4 GiB of program storage");
+            }
+            data_.resize(data_.size() + (GuestRegisterCount - DirectGuestRegisterCount) * 8, 0);
+            conditionOffset_ = data_.size();
+            data_.resize(data_.size() + 8, 0);
+            if (stateSnapshotFd_) {
+                snapshotOffset_ = data_.size();
+                data_.insert(data_.end(), {'S', 'A', 'S', 'M', 'S', 'T', '3', 0});
+                append64(data_, static_cast<uint64_t>(programDataSize_));
+                data_.resize(data_.size() + GuestRegisterCount * 8 + 8, 0);
+            }
+        }
+
+        void rejectStaticallyInvalidOperations() const {
+            ::rejectStaticallyInvalidOperations(
+                program_, dataLabels_, data_, programDataSize_, "ARM");
+        }
+
+        void buildCode() {
+            for (int guest = 0; guest < DirectGuestRegisterCount; ++guest) {
+                emitMove(nativeRegister(guest), 31);
+            }
+            for (const auto& instruction : program_.codeSection) {
+                if (instruction.label) {
+                    codeLabels_[*instruction.label] = code_.size();
+                }
+                emitInstruction(instruction);
+            }
+            emitExit();
+        }
+
+        void resolveFixups(std::size_t dataFileOffset) {
+            for (const auto& fixup : branchFixups_) {
+                const auto target = codeLabels_.find(fixup.label);
+                if (target == codeLabels_.end()) {
+                    throw std::invalid_argument("Unknown code label: " + fixup.label);
+                }
+                const uint32_t value = branchInstruction(
+                    fixup.instructionOffset, target->second, fixup.condition);
+                for (unsigned int shift = 0; shift < 32; shift += 8) {
+                    code_[fixup.instructionOffset + shift / 8] =
+                        static_cast<uint8_t>(value >> shift);
+                }
+            }
+            for (const auto& fixup : addressFixups_) {
+                const int64_t dataBase = static_cast<int64_t>(ImageBase) +
+                                         static_cast<int64_t>(dataFileOffset);
+                if (fixup.dataOffset > 0 &&
+                    dataBase > INT64_MAX - fixup.dataOffset) {
+                    throw std::invalid_argument("Data-label displacement overflow");
+                }
+                const int64_t targetAddress = dataBase + fixup.dataOffset;
+                const int64_t instructionAddress = static_cast<int64_t>(ImageBase) +
+                    static_cast<int64_t>(CodeFileOffset + fixup.adrpOffset);
+                const int64_t pageDelta =
+                    (targetAddress & ~INT64_C(0xFFF)) -
+                    (instructionAddress & ~INT64_C(0xFFF));
+                const int64_t pageImmediate = pageDelta / 4096;
+                if (pageImmediate < -(INT64_C(1) << 20) ||
+                    pageImmediate >= (INT64_C(1) << 20)) {
+                    throw std::invalid_argument("ARM data reference is out of ADRP range");
+                }
+                const uint32_t encodedPages =
+                    static_cast<uint32_t>(pageImmediate) & 0x1FFFFFU;
+                uint32_t adrp = 0x90000000U |
+                    ((encodedPages & 3U) << 29) |
+                    (((encodedPages >> 2) & 0x7FFFFU) << 5) |
+                    (code_[fixup.adrpOffset] & 0x1FU);
+                const uint32_t low = static_cast<uint32_t>(targetAddress) & 0xFFFU;
+                const uint32_t add = 0x91000000U | (low << 10) |
+                    ((adrp & 0x1FU) << 5) | (adrp & 0x1FU);
+                for (unsigned int shift = 0; shift < 32; shift += 8) {
+                    code_[fixup.adrpOffset + shift / 8] =
+                        static_cast<uint8_t>(adrp >> shift);
+                    code_[fixup.addOffset + shift / 8] =
+                        static_cast<uint8_t>(add >> shift);
+                }
+            }
+        }
+
+        static std::size_t alignTo(std::size_t value, std::size_t alignment) {
+            return (value + alignment - 1) & ~(alignment - 1);
+        }
+
+        std::vector<uint8_t> buildElf() {
+            const std::size_t dataFileOffset = alignTo(CodeFileOffset + code_.size(), 0x1000);
+            resolveFixups(dataFileOffset);
+            const std::size_t fileSize = dataFileOffset + data_.size();
+            std::vector<uint8_t> image(fileSize, 0);
+
+            image[0] = 0x7F;
+            image[1] = 'E';
+            image[2] = 'L';
+            image[3] = 'F';
+            image[4] = 2;
+            image[5] = 1;
+            image[6] = 1;
+            write16(image, 16, 2); // ET_EXEC
+            write16(image, 18, 183); // EM_AARCH64
+            write32(image, 20, 1);
+            write64(image, 24, ImageBase + CodeFileOffset);
+            write64(image, 32, 64);
+            write16(image, 52, 64);
+            write16(image, 54, 56);
+            write16(image, 56, 2);
+
+            write32(image, 64, 1); // RX PT_LOAD
+            write32(image, 68, 5);
+            write64(image, 72, 0);
+            write64(image, 80, ImageBase);
+            write64(image, 88, ImageBase);
+            write64(image, 96, CodeFileOffset + code_.size());
+            write64(image, 104, CodeFileOffset + code_.size());
+            write64(image, 112, 0x1000);
+
+            const std::size_t dataHeader = 64 + 56;
+            write32(image, dataHeader, 1); // RW PT_LOAD
+            write32(image, dataHeader + 4, 6);
+            write64(image, dataHeader + 8, dataFileOffset);
+            write64(image, dataHeader + 16, ImageBase + dataFileOffset);
+            write64(image, dataHeader + 24, ImageBase + dataFileOffset);
+            write64(image, dataHeader + 32, data_.size());
+            write64(image, dataHeader + 40, data_.size());
+            write64(image, dataHeader + 48, 0x1000);
+
+            std::copy(code_.begin(), code_.end(), image.begin() + CodeFileOffset);
+            std::copy(data_.begin(), data_.end(), image.begin() + dataFileOffset);
+            return image;
+        }
+
     public:
+        explicit ARMCodeGenerator(const Program& program, std::optional<int> stateSnapshotFd)
+            : program_(program), stateSnapshotFd_(stateSnapshotFd) {}
+
+        std::vector<uint8_t> generate() {
+            buildData();
+            rejectStaticallyInvalidOperations();
+            buildCode();
+            return buildElf();
+        }
+};
+
+class ARMEmitter final : public Emitter {
+    private:
+        std::optional<int> stateSnapshotFd_;
+
+    public:
+        explicit ARMEmitter(std::optional<int> stateSnapshotFd = std::nullopt)
+            : stateSnapshotFd_(stateSnapshotFd) {}
+
         std::vector<uint8_t> emit(const Program& program) const override {
-            (void)program;
-            throw std::logic_error("ARM emitter is not implemented");
+            return ARMCodeGenerator(program, stateSnapshotFd_).generate();
         }
 };
 
@@ -1627,12 +2475,13 @@ class PythonEmitter final : public Emitter {
 };
 
 std::unique_ptr<Emitter> createEmitter(Architecture architecture,
-                                       std::optional<int> x86StateSnapshotFd = std::nullopt) {
+                                       std::optional<int> x86StateSnapshotFd = std::nullopt,
+                                       std::optional<int> armStateSnapshotFd = std::nullopt) {
     switch (architecture) {
         case Architecture::X86:
             return std::make_unique<X86Emitter>(x86StateSnapshotFd);
         case Architecture::ARM:
-            return std::make_unique<ARMEmitter>();
+            return std::make_unique<ARMEmitter>(armStateSnapshotFd);
         case Architecture::IBMZ:
             return std::make_unique<IBMZEmitter>();
         case Architecture::Python:
@@ -2284,12 +3133,14 @@ static std::optional<Architecture> parseArchitecture_(const std::string& value) 
 static void printUsage_(const char* argv0) {
     std::cerr << "Usage: " << argv0 << " [--emit <target>] [-o <output_file>] <source_file.s>\n"
               << "Targets: print, x86, arm, ibmz, python\n"
-              << "       [--x86-state-fd <fd>] writes an x86 final-state snapshot to <fd>\n";
+              << "       [--x86-state-fd <fd>] writes an x86 final-state snapshot to <fd>\n"
+              << "       [--arm-state-fd <fd>] writes an ARM final-state snapshot to <fd>\n";
 }
 
 int main(int argc, char* argv[]) {
     std::optional<Architecture> target;
     std::optional<int> x86StateSnapshotFd;
+    std::optional<int> armStateSnapshotFd;
     std::string sourceFile;
     std::string outputFile;
 
@@ -2346,6 +3197,26 @@ int main(int argc, char* argv[]) {
             x86StateSnapshotFd = static_cast<int>(fd);
             continue;
         }
+        if (arg == "--arm-state-fd") {
+            if (i + 1 >= argc) {
+                std::cerr << "--arm-state-fd requires a non-negative file descriptor\n";
+                return 1;
+            }
+            const std::string value = argv[++i];
+            std::size_t parsedChars = 0;
+            long long fd = -1;
+            try {
+                fd = std::stoll(value, &parsedChars, 10);
+            } catch (const std::exception&) {
+                parsedChars = 0;
+            }
+            if (parsedChars != value.size() || fd < 3 || fd > INT32_MAX) {
+                std::cerr << "Invalid ARM state snapshot file descriptor: " << value << '\n';
+                return 1;
+            }
+            armStateSnapshotFd = static_cast<int>(fd);
+            continue;
+        }
         if (arg.rfind("--emit=", 0) == 0) {
             const std::string next = arg.substr(7);
             if (next == "print") {
@@ -2384,13 +3255,17 @@ int main(int argc, char* argv[]) {
         std::cerr << "--x86-state-fd is only supported with --emit x86\n";
         return 1;
     }
+    if (armStateSnapshotFd && (!target.has_value() || *target != Architecture::ARM)) {
+        std::cerr << "--arm-state-fd is only supported with --emit arm\n";
+        return 1;
+    }
 
     try {
         Parser parser(sourceFile);
         const Program program = parser.parse();
 
         if (target.has_value()) {
-            const auto emitter = createEmitter(*target, x86StateSnapshotFd);
+            const auto emitter = createEmitter(*target, x86StateSnapshotFd, armStateSnapshotFd);
             const auto output = emitter->emit(program);
             if (*target == Architecture::Python || *target == Architecture::X86) {
                 std::filesystem::path defaultOutputPath(sourceFile);

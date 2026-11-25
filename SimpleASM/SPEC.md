@@ -223,3 +223,33 @@ program's storage bytes in their original order. This excludes internal
 register backing slots and condition-state storage. The snapshot is emitted
 both for an explicit `EXIT` and when execution falls off the end of `.CODE`;
 without the option, generated behavior is unchanged.
+
+### AArch64 Emitter
+
+The ARM target emits a native AArch64 Linux ELF64 executable with separate
+read/execute code and read/write data segments. Numeric data entries occupy
+eight little-endian bytes and text entries are terminated by a zero byte.
+`WRTE` writes NUL-terminated text to standard output, and `EXIT` (or falling
+off the end of `.CODE`) terminates with the low byte of R0 as the process
+status.
+
+SimpleASM R0-R9 map to AArch64 X19-X28, respectively. These registers are
+preserved across Linux system calls, so guest values remain intact while
+`WRTE` and optional state-snapshot writes use the syscall registers. SimpleASM
+R10-R15 are spilled to six zero-initialized eight-byte slots placed after the
+program's declared storage in the writable data segment. Spilled values are
+loaded into scratch registers for operations and stored back after
+modification; spilled address bases are materialized before the memory
+operation. The spill slots are not part of guest storage and are excluded from
+state snapshots. X0-X17 are reserved for syscall arguments/results, operation
+temporaries, and address materialization; X18 is reserved by the platform, and
+X29-X30 are not used as guest registers. `Rc` is maintained separately from
+the processor flags in its own writable-data slot, so it persists between
+instructions.
+
+For testing, `--arm-state-fd <fd>` enables an optional final state snapshot on
+an inherited file descriptor (3 or higher). It uses the same `SASMST3\0`
+binary layout as the x86 snapshot and is emitted both for an explicit `EXIT`
+and when execution falls off the end of `.CODE`. It contains guest registers,
+`Rc`, and the declared program storage, but not ARM spill slots or internal
+condition storage. Without the option, generated behavior is unchanged.
