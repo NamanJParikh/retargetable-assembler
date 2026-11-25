@@ -3132,9 +3132,10 @@ static std::optional<Architecture> parseArchitecture_(const std::string& value) 
 
 static void printUsage_(const char* argv0) {
     std::cerr << "Usage: " << argv0 << " [--emit <target>] [-o <output_file>] <source_file.s>\n"
-              << "Targets: print, x86, arm, ibmz, python\n"
-              << "       [--x86-state-fd <fd>] writes an x86 final-state snapshot to <fd>\n"
-              << "       [--arm-state-fd <fd>] writes an ARM final-state snapshot to <fd>\n";
+              << "Targets: print, x86, arm, python\n"
+              << "Debugging options:\n"
+              << "       --x86-state-fd <fd> writes an x86 final-state snapshot to <fd>\n"
+              << "       --arm-state-fd <fd> writes an ARM final-state snapshot to <fd>\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -3247,8 +3248,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     if (!outputFile.empty() && (!target.has_value() ||
-        (*target != Architecture::Python && *target != Architecture::X86))) {
-        std::cerr << "--output is only supported with --emit python or --emit x86\n";
+        (*target != Architecture::Python && *target != Architecture::X86 &&
+         *target != Architecture::ARM))) {
+        std::cerr << "--output is only supported with --emit python, x86, or arm\n";
         return 1;
     }
     if (x86StateSnapshotFd && (!target.has_value() || *target != Architecture::X86)) {
@@ -3267,7 +3269,8 @@ int main(int argc, char* argv[]) {
         if (target.has_value()) {
             const auto emitter = createEmitter(*target, x86StateSnapshotFd, armStateSnapshotFd);
             const auto output = emitter->emit(program);
-            if (*target == Architecture::Python || *target == Architecture::X86) {
+            if (*target == Architecture::Python || *target == Architecture::X86 ||
+                *target == Architecture::ARM) {
                 std::filesystem::path defaultOutputPath(sourceFile);
                 defaultOutputPath.replace_extension(*target == Architecture::Python ? ".py" : ".out");
                 const std::filesystem::path outputPath = outputFile.empty()
@@ -3290,7 +3293,7 @@ int main(int argc, char* argv[]) {
                 if (!file) {
                     throw std::runtime_error("Could not close output file: " + outputPath.string());
                 }
-                if (*target == Architecture::X86) {
+                if (*target == Architecture::X86 || *target == Architecture::ARM) {
                     std::error_code permissionError;
                     std::filesystem::permissions(outputPath,
                         std::filesystem::perms::owner_read | std::filesystem::perms::owner_write |
@@ -3302,7 +3305,10 @@ int main(int argc, char* argv[]) {
                         throw std::runtime_error("Could not make executable file executable: " +
                                                  permissionError.message());
                     }
-                    std::cerr << "Wrote x86-64 Linux executable: " << outputPath.string() << '\n';
+                    std::cerr << (*target == Architecture::X86
+                        ? "Wrote x86-64 Linux executable: "
+                        : "Wrote AArch64 Linux executable: ")
+                              << outputPath.string() << '\n';
                     return 0;
                 }
                 std::cerr << "Wrote Python emulator: " << outputPath.string() << '\n';

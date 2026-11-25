@@ -62,11 +62,11 @@ offsetted hexadecimal/ASCII rows. If no path is provided, it reads `state.bin`
 from the current directory.
 
 The ARM emitter supports the same snapshot format using
-`--arm-state-fd <fd>`. Since ARM output is written to standard output, redirect
-it to an executable file before running it:
+`--arm-state-fd <fd>`. It writes an executable beside the source with a `.out`
+extension by default; `-o` can select another path.
 
 ```sh
-SimpleASM/compile --emit arm --arm-state-fd 3 path/to/program.sasm > /tmp/program.arm
+SimpleASM/compile --emit arm --arm-state-fd 3 -o /tmp/program.arm path/to/program.sasm
 docker run --rm --platform linux/arm64 -v /tmp:/work -w /work ubuntu:24.04 \
   sh -c 'exec 3>state-arm.bin; exec ./program.arm'
 python3 SimpleASM/test-scripts/show_emitter_state.py /tmp/state-arm.bin

@@ -229,6 +229,8 @@ without the option, generated behavior is unchanged.
 The ARM target emits a native AArch64 Linux ELF64 executable with separate
 read/execute code and read/write data segments. Numeric data entries occupy
 eight little-endian bytes and text entries are terminated by a zero byte.
+The executable is written beside the source with a `.out` extension by
+default; `-o` or `--output` selects another output path.
 `WRTE` writes NUL-terminated text to standard output, and `EXIT` (or falling
 off the end of `.CODE`) terminates with the low byte of R0 as the process
 status.

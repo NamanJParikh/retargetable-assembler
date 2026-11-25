@@ -47,17 +47,13 @@ def compile_arm_program(source, output, state_snapshot=False):
     command = [str(COMPILER), "--emit", "arm"]
     if state_snapshot:
         command.extend(["--arm-state-fd", "3"])
-    command.append(str(source))
-    result = subprocess.run(
+    command.extend(["-o", str(output), str(source)])
+    return subprocess.run(
         command,
         capture_output=True,
         timeout=15,
         check=False,
     )
-    if result.returncode == 0:
-        output.write_bytes(result.stdout)
-        output.chmod(output.stat().st_mode | 0o111)
-    return result
 
 
 def docker_unavailable_reason(platform=None):
@@ -190,6 +186,24 @@ class EmitterDifferentialTests(unittest.TestCase):
                 reference = source.with_suffix(".expected.py")
                 if source.parent == SHARED_FIXTURE_DIR and not expected.get("compile_error"):
                     self.assertTrue(reference.is_file(), f"Missing Python reference: {reference.name}")
+
+    def test_arm_emitter_writes_default_executable_file(self):
+        with tempfile.TemporaryDirectory(prefix="simpleasm-arm-output-") as temp_dir:
+            source = Path(temp_dir) / "program.sasm"
+            source.write_text(".CODE\nLI R0, d42\nEXIT\n")
+            result = subprocess.run(
+                [str(COMPILER), "--emit", "arm", str(source)],
+                capture_output=True,
+                timeout=15,
+                check=False,
+            )
+            output = source.with_suffix(".out")
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+            self.assertTrue(output.is_file())
+            self.assertNotEqual(output.stat().st_mode & 0o111, 0)
+            image = output.read_bytes()
+            self.assertEqual(image[:4], b"\x7fELF")
+            self.assertEqual(struct.unpack_from("<H", image, 18)[0], 183)
 
     def test_emitters_reject_statically_invalid_fixtures(self):
         for source in FIXTURE_SOURCES:
